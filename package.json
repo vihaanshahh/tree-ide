@@ -1,0 +1,20 @@
+{
+  "name": "tree-ide",
+  "version": "0.1.0",
+  "description": "Graph-first IDE: see what your AI is doing, live, on a map of your repo.",
+  "main": "main.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --enable-logging"
+  },
+  "author": "Vihaan Shah",
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.138",
+    "ignore": "^5.3.2"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  }
+}

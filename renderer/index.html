@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
+  <title>Tree IDE</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="titlebar">
+    <div class="title-left">
+      <div class="logo">◉</div>
+      <span class="title-text">Tree IDE</span>
+      <span id="repo-name" class="repo-name">no repo open</span>
+    </div>
+    <div class="title-actions">
+      <button id="theme-toggle" class="ghost-btn" title="Toggle theme">◐</button>
+      <button id="open-folder-btn" class="primary-btn">Open Repo</button>
+    </div>
+  </div>
+
+  <div id="app">
+    <aside id="sidebar">
+      <div class="panel-header">
+        <span>Roles</span>
+        <span id="file-count" class="dim">0</span>
+      </div>
+      <input id="filter-input" placeholder="filter roles…" />
+      <div id="file-list"></div>
+    </aside>
+
+    <div class="resize-handle" data-side="left" title="Drag to resize"></div>
+    <main id="canvas-area">
+      <canvas id="graph-canvas"></canvas>
+      <div id="canvas-overlay">
+        <div class="topbar">
+          <div class="blueprint-stamp">
+            <div class="stamp-title">SYSTEM BLUEPRINT</div>
+            <div class="stamp-sub" id="stamp-sub">no repo loaded</div>
+          </div>
+          <div class="search-wrap">
+            <span class="search-icon">⌕</span>
+            <input id="canvas-search" placeholder='Find any role or file — "auth", "user", "page"…' />
+            <button id="search-clear" class="search-clear hidden" title="Clear">×</button>
+          </div>
+          <div id="hud">
+            <span id="hud-status">Open a repo to begin</span>
+            <span id="hud-cost" class="dim"></span>
+          </div>
+        </div>
+        <div id="kind-filter" class="kind-filter"></div>
+      </div>
+      <div id="context-menu" class="hidden"></div>
+
+    </main>
+
+    <div class="resize-handle" data-side="right" title="Drag to resize"></div>
+    <aside id="rightpanel">
+      <div class="tabs">
+        <button class="tab active" data-tab="module">Module</button>
+        <button class="tab" data-tab="chat">Ask AI</button>
+        <button class="tab" data-tab="log">Activity</button>
+        <button class="tab" data-tab="file">File</button>
+      </div>
+
+      <section class="tab-pane active" data-pane="module">
+        <div id="module-detail">
+          <div class="empty-state">
+            <h3>Click a module</h3>
+            <p>Each card on the map is a top-level directory. Pick one to see what's inside, audit its behavior, or swap it for something else.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="tab-pane" data-pane="chat">
+        <div class="agents-toolbar">
+          <div>
+            <span class="agents-title">Agents</span>
+            <span id="agents-count" class="dim">0</span>
+          </div>
+          <button id="new-agent-btn" class="ghost-btn">New Agent</button>
+        </div>
+        <div id="agents-grid"></div>
+      </section>
+
+      <section class="tab-pane" data-pane="log">
+        <div id="log-list"></div>
+      </section>
+
+      <section class="tab-pane" data-pane="file">
+        <div id="file-viewer">Select a file to inspect.</div>
+      </section>
+    </aside>
+  </div>
+
+  <!-- Welcome modal -->
+  <div id="welcome" class="modal">
+    <div class="modal-content">
+      <h1>Tree IDE</h1>
+      <p>An IDE that thinks in modules, not files. See your codebase as labeled cards, audit any one of them, or <b>swap one out for something else</b> with one click.</p>
+      <ul>
+        <li>Open any repo. Each top-level directory becomes a card on the map.</li>
+        <li>Click a card. Right panel shows the files inside and three actions: <b>Audit</b>, <b>Swap with…</b>, <b>Explain</b>.</li>
+        <li><b>Swap</b> describes the replacement, AI plans it, you preview the diff, you click apply.</li>
+      </ul>
+      <p class="dim">Uses your Claude subscription via the <code>claude</code> CLI.</p>
+      <button id="welcome-open" class="primary-btn big">Open a Repo</button>
+    </div>
+  </div>
+
+  <!-- Swap modal -->
+  <div id="swap-modal" class="modal hidden">
+    <div class="modal-content swap-modal">
+      <h2 id="swap-title">Swap module</h2>
+      <div class="swap-current-wrap">
+        <div class="dim small">Currently:</div>
+        <div id="swap-current" class="swap-current"></div>
+      </div>
+      <div class="swap-input-wrap">
+        <label>Replace with:</label>
+        <textarea id="swap-input" rows="2" placeholder="e.g. Clerk auth instead of NextAuth, Postgres instead of SQLite, RESTful API instead of GraphQL…"></textarea>
+      </div>
+      <div class="row">
+        <button id="swap-plan-btn" class="primary-btn">Plan</button>
+        <button id="swap-apply-btn" class="primary-btn alt" disabled>Apply</button>
+        <button id="swap-cancel-btn" class="ghost-btn">Cancel</button>
+      </div>
+      <div id="swap-plan-out" class="swap-plan"></div>
+    </div>
+  </div>
+
+  <script src="graph.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
