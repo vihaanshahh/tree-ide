@@ -5,42 +5,40 @@ set -euo pipefail
 #
 # 1. Validate working tree + git state
 # 2. Resolve target version (from package.json, or --version, or --bump)
-# 3. npm run dist (electron-builder, both arm64 + x64 dmg)
-# 4. Verify dist/ contains the four expected dmg artifacts
-# 5. Bump package.json + commit + tag + push
-# 6. gh release create with all dmgs uploaded
-# 7. POST fs-code-landing /api/releases/revalidate
-#
-# Unlike fs-code, the build runs locally — electron-builder needs a Mac
-# host with code-signing disabled (already configured in package.json's
-# `mac.identity: null`). No GitHub Actions in the loop.
+# 3. Tag + push  (triggers .github/workflows/release.yml which builds
+#    arm64 + x64 dmgs on macOS and an .exe installer on Windows)
+# 4. Poll the workflow run until done
+# 5. Verify the GH release contains every expected asset
+# 6. POST fs-code-landing /api/releases/revalidate
 
 usage() {
   cat <<'USAGE'
 Usage: scripts/release.sh [options]
 
 Options:
-  --version X.Y.Z    Target version. Defaults to package.json's "version".
+  --version X.Y.Z    Target version. Defaults to package.json "version".
   --bump             Bump patch component of package.json (0.2.0 -> 0.2.1).
   --dry-run          Validate everything, print what *would* happen,
-                     but do not edit package.json, tag, push, build, or
-                     call any external API.
-  --skip-build       Skip `npm run dist` (assume dist/ already has dmgs).
+                     but do not edit package.json, tag, push, or call
+                     any external API.
   --skip-revalidate  Skip the landing-site cache flush.
-  --landing-url URL  Override landing site base URL.
-                     Default: https://www.fluidstate.ai
+  --no-poll          Tag + push, then exit (do not wait for CI).
+  --landing-url URL  Override landing base URL. Default: https://www.fluidstate.ai
+  --timeout SECONDS  Workflow poll timeout. Default: 2400 (40 min — electron
+                     builds are heavier than the fs-code Rust ones).
   -h, --help         Show this message.
 
 Environment:
   GH_TOKEN / GITHUB_TOKEN  Used by `gh` (already required).
   FS_LANDING_REVALIDATE_SECRET
                            Shared secret POSTed to the landing's
-                           /api/releases/revalidate endpoint.
+                           /api/releases/revalidate endpoint. On macOS,
+                           falls back to keychain entry of the same name.
 
 Exit codes:
   0  success
   1  validation failure
-  2  build failed or assets missing
+  2  workflow failed, timed out, or assets missing
   3  landing revalidate failed
 USAGE
 }
@@ -49,10 +47,11 @@ USAGE
 
 dry_run=0
 do_bump=0
-skip_build=0
+no_poll=0
 skip_revalidate=0
 explicit_version=""
 landing_url="${FS_LANDING_URL:-https://www.fluidstate.ai}"
+timeout_secs=2400
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -62,27 +61,29 @@ while [ "$#" -gt 0 ]; do
       shift 2 ;;
     --bump)             do_bump=1; shift ;;
     --dry-run)          dry_run=1; shift ;;
-    --skip-build)       skip_build=1; shift ;;
+    --no-poll)          no_poll=1; shift ;;
     --skip-revalidate)  skip_revalidate=1; shift ;;
     --landing-url)
       landing_url="${2:-}"
       [ -z "$landing_url" ] && { echo "release.sh: --landing-url requires an argument" >&2; exit 2; }
+      shift 2 ;;
+    --timeout)
+      timeout_secs="${2:-}"
+      [ -z "$timeout_secs" ] && { echo "release.sh: --timeout requires an argument" >&2; exit 2; }
       shift 2 ;;
     -h|--help)          usage; exit 0 ;;
     *)                  echo "release.sh: unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
-# ─── output ───────────────────────────────────────────────────────────────────
-
-# If the secret isn't in the environment, try the macOS keychain so
-# devs don't need to re-export it every shell. Falls through silently
-# if the keychain entry isn't there.
+# Keychain fallback for the landing secret (macOS only).
 if [ -z "${FS_LANDING_REVALIDATE_SECRET:-}" ] && command -v security >/dev/null 2>&1; then
   kc_secret="$(security find-generic-password -a "$USER" -s "FS_LANDING_REVALIDATE_SECRET" -w 2>/dev/null || true)"
   [ -n "$kc_secret" ] && export FS_LANDING_REVALIDATE_SECRET="$kc_secret"
   unset kc_secret
 fi
+
+# ─── output ───────────────────────────────────────────────────────────────────
 
 if [ -t 2 ]; then
   C_DIM='\033[2m'; C_BOLD='\033[1m'
@@ -109,34 +110,26 @@ step "Prerequisites"
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-if [ ! -f package.json ]; then
-  fail "package.json not found — wrong repo?"
-  exit 1
-fi
-
-if [[ "$(uname -s)" != "Darwin" ]]; then
-  fail "electron-builder mac dmg target requires macOS host"
-  exit 1
-fi
+[ -f package.json ] || { fail "package.json not found"; exit 1; }
 ok "repo: $(basename "$repo_root")"
-ok "host: macOS ($(uname -m))"
 
-for bin in node npm git gh curl; do
-  if ! command -v "$bin" >/dev/null 2>&1; then
-    fail "required binary not found: $bin"
-    exit 1
-  fi
+for bin in node git gh curl; do
+  command -v "$bin" >/dev/null 2>&1 || { fail "required binary not found: $bin"; exit 1; }
 done
-ok "node, npm, git, gh, curl available"
+ok "node, git, gh, curl available"
 
-if ! gh auth status >/dev/null 2>&1; then
-  fail "gh is not authenticated. Run: gh auth login"
-  exit 1
-fi
+gh auth status >/dev/null 2>&1 || { fail "gh not authenticated"; exit 1; }
 ok "gh authenticated"
 
 repo_slug="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
 ok "github: $repo_slug"
+
+# Workflow file must exist or the tag push triggers nothing.
+if [ ! -f .github/workflows/release.yml ]; then
+  fail ".github/workflows/release.yml missing — tag push would do nothing"
+  exit 1
+fi
+ok ".github/workflows/release.yml present"
 
 # ─── working tree ─────────────────────────────────────────────────────────────
 
@@ -174,8 +167,7 @@ read_pkg_version() {
 }
 
 bump_patch() {
-  local v
-  v="$(read_pkg_version)"
+  local v; v="$(read_pkg_version)"
   if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     fail "package.json version '$v' is not x.y.z"
     return 1
@@ -224,7 +216,7 @@ if [ "$target_version" != "$current_version" ]; then
   step "Bump package.json"
   if [ "$dry_run" -eq 1 ]; then
     dry "rewrite package.json version: $current_version → $target_version"
-    dry "git add package.json && git commit -m 'chore: bump version to v${target_version}'"
+    dry "git commit + push (origin/$current_branch)"
   else
     node -e "
       const fs = require('fs');
@@ -234,59 +226,11 @@ if [ "$target_version" != "$current_version" ]; then
     "
     git add package.json
     git commit -m "chore: bump version to v${target_version}" >/dev/null
-    ok "bumped + committed $current_version → $target_version"
+    git push origin "$current_branch"
+    ok "bumped + committed + pushed $current_version → $target_version"
+    # Refresh local_sha for the tag.
+    local_sha="$(git rev-parse HEAD)"
   fi
-fi
-
-# ─── build ────────────────────────────────────────────────────────────────────
-
-step "Build"
-
-expected_dmgs=(
-  "Tree-${target_version}-arm64.dmg"
-  "Tree-${target_version}.dmg"
-)
-alias_dmgs=(
-  "Tree-arm64.dmg"
-  "Tree-x64.dmg"
-)
-
-if [ "$skip_build" -eq 1 ]; then
-  warn "--skip-build set; assuming dist/ is current"
-elif [ "$dry_run" -eq 1 ]; then
-  dry "npm run dist (electron-builder --mac dmg --arm64 --x64)"
-  for d in "${expected_dmgs[@]}" "${alias_dmgs[@]}"; do
-    printf "    ${C_DIM}• dist/%s${C_RESET}\n" "$d" >&2
-  done
-else
-  ok "running: npm run dist"
-  if ! npm run dist 1>&2; then
-    fail "npm run dist failed"
-    exit 2
-  fi
-  ok "build complete"
-fi
-
-# ─── verify + create aliases ──────────────────────────────────────────────────
-
-step "Verify artifacts"
-
-if [ "$dry_run" -eq 1 ]; then
-  dry "verify all four dmgs exist in dist/"
-else
-  for d in "${expected_dmgs[@]}"; do
-    if [ ! -f "dist/$d" ]; then
-      fail "missing build artifact: dist/$d"
-      exit 2
-    fi
-    ok "dist/$d ($(du -h "dist/$d" | awk '{print $1}'))"
-  done
-
-  # Refresh the version-less aliases the landing site downloads. cp
-  # over any stale aliases from previous builds.
-  cp "dist/Tree-${target_version}-arm64.dmg" "dist/Tree-arm64.dmg"
-  cp "dist/Tree-${target_version}.dmg"        "dist/Tree-x64.dmg"
-  ok "refreshed Tree-arm64.dmg + Tree-x64.dmg aliases"
 fi
 
 # ─── tag + push ───────────────────────────────────────────────────────────────
@@ -295,45 +239,90 @@ step "Tag + push"
 
 if [ "$dry_run" -eq 1 ]; then
   dry "git tag -a $tag -m \"$tag\""
-  dry "git push origin $current_branch"
   dry "git push origin $tag"
 else
   git tag -a "$tag" -m "$tag"
-  ok "created tag $tag"
-
-  # Push the bump commit first (if there is one), then the tag.
-  if [ "$target_version" != "$current_version" ]; then
-    git push origin "$current_branch"
-    ok "pushed bump commit to origin/$current_branch"
-  fi
+  ok "created tag $tag at $local_sha"
   git push origin "$tag"
-  ok "pushed $tag to origin"
+  ok "pushed $tag (this triggers .github/workflows/release.yml)"
 fi
 
-# ─── create GH release ────────────────────────────────────────────────────────
+# ─── poll workflow ────────────────────────────────────────────────────────────
 
-step "Create GitHub release"
+if [ "$no_poll" -eq 1 ]; then
+  step "Workflow poll skipped (--no-poll)"
+else
+  step "Polling Release workflow"
+
+  if [ "$dry_run" -eq 1 ]; then
+    dry "gh run watch (release.yml @ $tag)"
+  else
+    deadline=$(( $(date +%s) + timeout_secs ))
+    run_id=""
+    while [ -z "$run_id" ]; do
+      if [ "$(date +%s)" -ge "$deadline" ]; then
+        fail "timed out waiting for workflow to start"
+        exit 2
+      fi
+      run_id="$(gh run list \
+        --workflow=release.yml \
+        --event=push \
+        --limit 20 \
+        --json databaseId,headBranch \
+        -q "[.[] | select(.headBranch == \"$tag\")] | .[0].databaseId" 2>/dev/null || true)"
+      [ -z "$run_id" ] && sleep 5
+    done
+    ok "run $run_id queued (https://github.com/$repo_slug/actions/runs/$run_id)"
+
+    if gh run watch "$run_id" --exit-status; then
+      ok "workflow succeeded"
+    else
+      fail "workflow failed (run $run_id)"
+      exit 2
+    fi
+  fi
+fi
+
+# ─── verify release assets ────────────────────────────────────────────────────
+
+step "Verify release assets"
+
+expected_assets=(
+  "Tree-${target_version}-arm64.dmg"
+  "Tree-${target_version}.dmg"
+  "Tree-arm64.dmg"
+  "Tree-x64.dmg"
+  "Tree-Setup-${target_version}.exe"
+  "Tree-Setup.exe"
+)
 
 if [ "$dry_run" -eq 1 ]; then
-  dry "gh release create $tag --title \"Tree IDE $tag\" --generate-notes \\"
-  for d in "${expected_dmgs[@]}" "${alias_dmgs[@]}"; do
-    dry "  dist/$d"
+  dry "gh release view $tag --json assets"
+  for a in "${expected_assets[@]}"; do
+    printf "    ${C_DIM}• %s${C_RESET}\n" "$a" >&2
   done
 else
-  upload_args=()
-  for d in "${expected_dmgs[@]}" "${alias_dmgs[@]}"; do
-    upload_args+=("dist/$d")
+  release_deadline=$(( $(date +%s) + 180 ))
+  while ! gh release view "$tag" >/dev/null 2>&1; do
+    if [ "$(date +%s)" -ge "$release_deadline" ]; then
+      fail "release $tag never appeared after workflow success"
+      exit 2
+    fi
+    sleep 3
   done
 
-  if gh release create "$tag" \
-       --title "Tree IDE $tag" \
-       --generate-notes \
-       "${upload_args[@]}" >/dev/null; then
-    ok "released $tag with ${#upload_args[@]} dmg assets"
-  else
-    fail "gh release create failed"
+  asset_list="$(gh release view "$tag" --json assets -q '.assets[].name')"
+  missing=()
+  for a in "${expected_assets[@]}"; do
+    grep -Fxq "$a" <<<"$asset_list" || missing+=("$a")
+  done
+
+  if [ "${#missing[@]}" -gt 0 ]; then
+    fail "release $tag is missing assets:"
+    for m in "${missing[@]}"; do printf "       %s\n" "$m" >&2; done
     exit 2
   fi
+  ok "all ${#expected_assets[@]} expected assets present"
 fi
 
 # ─── notify landing ───────────────────────────────────────────────────────────
@@ -351,7 +340,7 @@ elif [ "$dry_run" -eq 1 ]; then
   fi
 elif [ -z "${FS_LANDING_REVALIDATE_SECRET:-}" ]; then
   fail "FS_LANDING_REVALIDATE_SECRET not set — cannot flush landing cache"
-  fail "  (release is published; just rerun with the env var to notify the site)"
+  fail "  (release is published; rerun with the env var to notify the site)"
   exit 3
 else
   http_code="$(curl -sSL -o /tmp/tree-release-revalidate.out -w '%{http_code}' \
