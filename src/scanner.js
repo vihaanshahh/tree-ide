@@ -34,6 +34,29 @@ const SKIP_DIR_PREFIXES = ['.venv', 'venv-', 'env-', '.virtualenv'];
 
 const JS_EXTS = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs']);
 const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'];
+const ANALYSIS_CACHE = new Map();
+const MAX_ROOT_CACHES = 4;
+
+function cloneData(v) {
+  return v == null ? v : JSON.parse(JSON.stringify(v));
+}
+
+function cacheKeyForFile(f) {
+  return `${f.size || 0}:${Math.round(f.mtimeMs || 0)}`;
+}
+
+function cacheForRoot(root) {
+  let cache = ANALYSIS_CACHE.get(root);
+  if (!cache) {
+    cache = new Map();
+    ANALYSIS_CACHE.set(root, cache);
+    while (ANALYSIS_CACHE.size > MAX_ROOT_CACHES) {
+      const oldest = ANALYSIS_CACHE.keys().next().value;
+      ANALYSIS_CACHE.delete(oldest);
+    }
+  }
+  return cache;
+}
 
 function loadIgnore(root) {
   const ig = ignore();
@@ -191,9 +214,14 @@ function walkRepo(root, opts = {}) {
         const ext = path.extname(e.name).toLowerCase();
         if (!CODE_EXT.has(ext) && !CODE_FILENAMES.has(e.name)) continue;
         let size = 0;
-        try { size = fs.statSync(full).size; } catch {}
+        let mtimeMs = 0;
+        try {
+          const st = fs.statSync(full);
+          size = st.size;
+          mtimeMs = st.mtimeMs;
+        } catch {}
         if (size > 500_000) continue;
-        files.push({ rel, full, ext, size });
+        files.push({ rel, full, ext, size, mtimeMs });
       }
     }
   }
@@ -1011,6 +1039,8 @@ async function buildGraph(root, opts = {}) {
 
   const fileNodes = [];
   const fileMeta = new Map(); // rel -> { exports, importsDetailed, semantic, apiCalls, isRoute, sublabel }
+  const rootCache = cacheForRoot(root);
+  const seenRels = new Set(files.map(f => f.rel));
   // We keep lightweight `apiCalls` metadata per file (parsed inline) instead of
   // holding full content in memory after the initial scan.
 
@@ -1019,6 +1049,17 @@ async function buildGraph(root, opts = {}) {
   for (let i = 0; i < files.length; i += concurrency) {
     const batch = files.slice(i, i + concurrency);
     await Promise.all(batch.map(async (f) => {
+      const cacheKey = includeFnEdges ? null : cacheKeyForFile(f);
+      const cached = cacheKey ? rootCache.get(f.rel) : null;
+      if (cached && cached.key === cacheKey) {
+        fileMeta.set(f.rel, cloneData(cached.meta));
+        fileNodes.push({
+          ...cloneData(cached.node),
+          gitStatus: gitStatusByRel.get(f.rel) || null,
+        });
+        return;
+      }
+
       let content = '';
       try { content = await fsP.readFile(f.full, 'utf8'); } catch { content = ''; }
       if (content.length > 200_000) content = content.slice(0, 200_000);
@@ -1052,7 +1093,7 @@ async function buildGraph(root, opts = {}) {
         tables = extractSqlTables(content);
       }
 
-      fileMeta.set(f.rel, {
+      const metaEntry = {
         exports,
         importsDetailed,
         semantic,
@@ -1061,10 +1102,11 @@ async function buildGraph(root, opts = {}) {
         tables,
         endpoints,
         content: includeFnEdges ? content : null,
-      });
+      };
+      fileMeta.set(f.rel, metaEntry);
 
       const baseName = path.basename(f.rel);
-      fileNodes.push({
+      const nodeBase = {
         id: f.rel,
         label: semantic ? semantic.label : baseName,
         sublabel: semantic ? semantic.sublabel : '',
@@ -1075,16 +1117,29 @@ async function buildGraph(root, opts = {}) {
         size: f.size,
         type: 'file',
         filename: baseName,
-        gitStatus: gitStatusByRel.get(f.rel) || null,
         exports: exports.map(e => ({ name: e.name, kind: e.kind, line: e.line })),
         // Lightweight import metadata for the renderer's "consumers" feature.
         importsRefs: importsDetailed
           .filter(i => i.local && i.names.length)
           .map(i => ({ source: i.source, names: i.names })),
+      };
+      fileNodes.push({
+        ...nodeBase,
+        gitStatus: gitStatusByRel.get(f.rel) || null,
       });
+      if (cacheKey) {
+        rootCache.set(f.rel, {
+          key: cacheKey,
+          meta: cloneData(metaEntry),
+          node: cloneData(nodeBase),
+        });
+      }
     }));
     processed += batch.length;
     if (onProgress) onProgress(processed, files.length);
+  }
+  for (const rel of rootCache.keys()) {
+    if (!seenRels.has(rel)) rootCache.delete(rel);
   }
 
   // Edges

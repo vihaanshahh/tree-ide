@@ -4,18 +4,39 @@
   <meta charset="UTF-8" />
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
-  <title>Tree IDE</title>
+  <title>Tree</title>
+  <link rel="stylesheet" href="../node_modules/@xterm/xterm/css/xterm.css" />
   <link rel="stylesheet" href="styles.css" />
+  <script src="../node_modules/@xterm/xterm/lib/xterm.js"></script>
+  <script src="../node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
 </head>
 <body>
   <div id="titlebar">
     <div class="title-left">
-      <div class="logo">◉</div>
-      <span class="title-text">Tree IDE</span>
+      <svg class="logo" viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+        <!-- Rounded sand-colored badge with a directory-tree carved into it.
+             Both colors come from CSS vars so it flips with the light theme. -->
+        <rect class="logo-bg" x="0" y="0" width="24" height="24" rx="5" ry="5"/>
+        <g class="logo-fg" stroke-width="1" stroke-linecap="square" shape-rendering="crispEdges">
+          <rect x="3"  y="4"  width="3" height="3"/>
+          <rect x="10" y="4"  width="3" height="3"/>
+          <rect x="10" y="11" width="3" height="3"/>
+          <rect x="17" y="11" width="3" height="3"/>
+          <rect x="17" y="17" width="3" height="3"/>
+          <path fill="none" stroke="currentColor" d="M4.5 7 V18.5 M4.5 5.5 H10 M4.5 12.5 H10 M11.5 14 V18.5 M11.5 12.5 H17 M11.5 18.5 H17"/>
+        </g>
+      </svg>
+      <span class="title-text">Tree</span>
       <span id="repo-name" class="repo-name">no repo open</span>
     </div>
     <div class="title-actions">
+      <div class="view-switch" aria-label="Workspace view">
+        <button id="agents-view-btn" class="view-btn active" title="Show agents">Agents</button>
+        <button id="graph-view-btn" class="view-btn" title="Show graph">Graph</button>
+      </div>
       <button id="theme-toggle" class="ghost-btn" title="Toggle theme">◐</button>
+      <button id="recent-toggle" class="ghost-btn" title="Recent repos">Recent</button>
+      <div id="recent-menu" class="recent-menu hidden"></div>
       <button id="open-folder-btn" class="primary-btn">Open Repo</button>
     </div>
   </div>
@@ -58,22 +79,22 @@
     <div class="resize-handle" data-side="right" title="Drag to resize"></div>
     <aside id="rightpanel">
       <div class="tabs">
-        <button class="tab active" data-tab="module">Module</button>
-        <button class="tab" data-tab="chat">Ask AI</button>
+        <button class="tab" data-tab="module">Module</button>
+        <button class="tab active" data-tab="chat">Agents</button>
         <button class="tab" data-tab="log">Activity</button>
         <button class="tab" data-tab="file">File</button>
       </div>
 
-      <section class="tab-pane active" data-pane="module">
+      <section class="tab-pane" data-pane="module">
         <div id="module-detail">
           <div class="empty-state">
-            <h3>Click a module</h3>
-            <p>Each card on the map is a top-level directory. Pick one to see what's inside, audit its behavior, or swap it for something else.</p>
+            <h3>Click a node on the blueprint</h3>
+            <p>Each node is a real file. Click one to see what it exports and how it connects to the rest of the system.</p>
           </div>
         </div>
       </section>
 
-      <section class="tab-pane" data-pane="chat">
+      <section class="tab-pane active" data-pane="chat">
         <div class="agents-toolbar">
           <div>
             <span class="agents-title">Agents</span>
@@ -97,38 +118,35 @@
   <!-- Welcome modal -->
   <div id="welcome" class="modal">
     <div class="modal-content">
-      <h1>Tree IDE</h1>
-      <p>An IDE that thinks in modules, not files. See your codebase as labeled cards, audit any one of them, or <b>swap one out for something else</b> with one click.</p>
+      <svg class="logo-xl logo" viewBox="0 0 24 24" width="96" height="96" aria-hidden="true">
+        <rect class="logo-bg" x="0" y="0" width="24" height="24" rx="5" ry="5"/>
+        <g class="logo-fg" stroke-width="1" stroke-linecap="square" shape-rendering="crispEdges">
+          <rect x="3"  y="4"  width="3" height="3"/>
+          <rect x="10" y="4"  width="3" height="3"/>
+          <rect x="10" y="11" width="3" height="3"/>
+          <rect x="17" y="11" width="3" height="3"/>
+          <rect x="17" y="17" width="3" height="3"/>
+          <path fill="none" stroke="currentColor" d="M4.5 7 V18.5 M4.5 5.5 H10 M4.5 12.5 H10 M11.5 14 V18.5 M11.5 12.5 H17 M11.5 18.5 H17"/>
+        </g>
+      </svg>
+      <h1>Tree</h1>
+      <p>A graph-first IDE. Open any repo and see it as a live blueprint of pages, endpoints, tables and the connections between them.</p>
       <ul>
-        <li>Open any repo. Each top-level directory becomes a card on the map.</li>
-        <li>Click a card. Right panel shows the files inside and three actions: <b>Audit</b>, <b>Swap with…</b>, <b>Explain</b>.</li>
-        <li><b>Swap</b> describes the replacement, AI plans it, you preview the diff, you click apply.</li>
+        <li>Open any repo — the canvas maps every file into its architectural role.</li>
+        <li>Run agents (shell, claude, codex) right inside the app, side by side.</li>
+        <li>Every write on disk flashes the touched node on the graph in real time.</li>
       </ul>
-      <p class="dim">Uses your Claude subscription via the <code>claude</code> CLI.</p>
       <button id="welcome-open" class="primary-btn big">Open a Repo</button>
+      <div class="recent-panel">
+        <div class="recent-head">
+          <span>Recent repos</span>
+          <button id="recent-clear" class="ghost-btn">Clear</button>
+        </div>
+        <div id="welcome-recents" class="recent-list"></div>
+      </div>
     </div>
   </div>
 
-  <!-- Swap modal -->
-  <div id="swap-modal" class="modal hidden">
-    <div class="modal-content swap-modal">
-      <h2 id="swap-title">Swap module</h2>
-      <div class="swap-current-wrap">
-        <div class="dim small">Currently:</div>
-        <div id="swap-current" class="swap-current"></div>
-      </div>
-      <div class="swap-input-wrap">
-        <label>Replace with:</label>
-        <textarea id="swap-input" rows="2" placeholder="e.g. Clerk auth instead of NextAuth, Postgres instead of SQLite, RESTful API instead of GraphQL…"></textarea>
-      </div>
-      <div class="row">
-        <button id="swap-plan-btn" class="primary-btn">Plan</button>
-        <button id="swap-apply-btn" class="primary-btn alt" disabled>Apply</button>
-        <button id="swap-cancel-btn" class="ghost-btn">Cancel</button>
-      </div>
-      <div id="swap-plan-out" class="swap-plan"></div>
-    </div>
-  </div>
 
   <script src="graph.js"></script>
   <script src="app.js"></script>

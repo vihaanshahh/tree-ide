@@ -37,6 +37,8 @@ const KIND_PRETTY = {
 let SAND = '231, 222, 209'; // rgb of #e7ded1 in dark mode, ink in light mode
 let CANVAS_BG = '#000000';
 let INVERT_TEXT = '#000000';
+let GRAPH_THEME = null;
+let TINT_CACHE = new Map();
 
 const KIND_TINT_DARK = {
   // INTERFACE
@@ -121,11 +123,38 @@ const KIND_HUE = {
   schema: 170, model: 185, infra: 25, config: 40, test: 50, docs: 245, module: 35, other: 35, external: 35,
 };
 
+const HTTP_VERB_ORDER = new Map(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'].map((v, i) => [v, i]));
+
+function endpointVerbOf(f) {
+  const verb = f && (f.verb || String(f.label || '').match(/^(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\b/i)?.[1]);
+  return String(verb || '').toUpperCase();
+}
+
+function endpointPathOf(f) {
+  if (!f) return '';
+  if (f.fullPath) return f.fullPath;
+  const label = String(f.label || '');
+  return label.replace(/^(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\s+/i, '') || f.id;
+}
+
+function endpointVerbRank(f) {
+  const verb = endpointVerbOf(f);
+  return HTTP_VERB_ORDER.has(verb) ? HTTP_VERB_ORDER.get(verb) : 99;
+}
+
 function tintRGB(kind, alpha = 1) {
-  const tint = (isLightTheme() ? KIND_TINT_LIGHT : KIND_TINT_DARK)[kind] || `rgba(${SAND}, ${alpha})`;
-  if (alpha === 1) return tint;
+  const key = `${GRAPH_THEME || 'dark'}|${kind}|${alpha}`;
+  const cached = TINT_CACHE.get(key);
+  if (cached) return cached;
+  const tint = (GRAPH_THEME === 'light' ? KIND_TINT_LIGHT : KIND_TINT_DARK)[kind] || `rgba(${SAND}, ${alpha})`;
+  if (alpha === 1) {
+    TINT_CACHE.set(key, tint);
+    return tint;
+  }
   // Convert hsl(...) to hsla
-  return tint.replace('hsl(', 'hsla(').replace(')', `, ${alpha})`);
+  const out = tint.replace('hsl(', 'hsla(').replace(')', `, ${alpha})`);
+  TINT_CACHE.set(key, out);
+  return out;
 }
 
 function isLightTheme() {
@@ -133,7 +162,11 @@ function isLightTheme() {
 }
 
 function syncGraphTheme() {
-  if (isLightTheme()) {
+  const nextTheme = isLightTheme() ? 'light' : 'dark';
+  if (GRAPH_THEME === nextTheme) return;
+  GRAPH_THEME = nextTheme;
+  TINT_CACHE = new Map();
+  if (nextTheme === 'light') {
     SAND = '31, 34, 30';
     CANVAS_BG = '#f7f8f5';
     INVERT_TEXT = '#f7f8f5';
@@ -145,7 +178,7 @@ function syncGraphTheme() {
 }
 
 function bgAlpha(alpha) {
-  return isLightTheme()
+  return GRAPH_THEME === 'light'
     ? `rgba(247, 248, 245, ${alpha})`
     : `rgba(0, 0, 0, ${alpha})`;
 }
@@ -161,8 +194,16 @@ class Graph {
 
     this.layers = [];           // [{ id, name, x,y,w,h, sections: [{kind, name, x,y,w,h, files: [file]}] }]
     this.files = new Map();     // id -> file (positioned)
+    this.visibleFiles = [];     // non-hidden files after relayout
+    this.visibleEdges = [];     // edges whose endpoints are visible after relayout
+    this.hitFiles = [];         // positioned files in draw order, reused for hit-testing
     this.fileEdges = [];        // import edges (file → file or file → ext id)
     this.fnEdges = [];
+    this.edgesBySource = new Map();
+    this.edgesByTarget = new Map();
+    this.flowEdgesBySource = new Map();
+    this.flowEdgesByTarget = new Map();
+    this.neighborhoodCache = null;
 
     this.aiNode = { id: '__ai__', x: 0, y: 0 };
     this.selected = null;
@@ -206,29 +247,73 @@ class Graph {
     this.lastMouse = { x: 0, y: 0 };
     this.didDrag = false;
     this.needsDraw = true;
+    this.paused = false;
+    this.resizeCanvas = null;
+    this.frameScheduled = false;
+    this.fastUntil = 0;
+    this.fastTimer = null;
+    this.hoverFrame = 0;
+    this.pendingHoverPoint = null;
+    this.activeGlowIds = new Set();
 
     this.pulses = [];
 
     this.setupCanvas();
     this.setupInput();
-    requestAnimationFrame(() => this.frame());
+    this.scheduleFrame();
   }
 
   invalidate() {
     this.needsDraw = true;
+    this.scheduleFrame();
+  }
+
+  markInteracting(ms = 140) {
+    this.fastUntil = Math.max(this.fastUntil || 0, performance.now() + ms);
+    if (this.fastTimer) clearTimeout(this.fastTimer);
+    this.fastTimer = setTimeout(() => {
+      this.fastTimer = null;
+      this.invalidate();
+    }, ms + 24);
+  }
+
+  scheduleFrame() {
+    if (this.paused || this.frameScheduled) return;
+    this.frameScheduled = true;
+    requestAnimationFrame(() => this.frame());
   }
 
   setupCanvas() {
     const resize = () => {
       const r = this.canvas.getBoundingClientRect();
-      this.canvas.width = r.width * this.dpr;
-      this.canvas.height = r.height * this.dpr;
+      if (r.width < 2 || r.height < 2) return;
+      // Retina 2x canvases roughly quadruple pixel work during panning. A
+      // small cap keeps text readable while cutting a large amount of fill.
+      const rawDpr = window.devicePixelRatio || 1;
+      const nextDpr = rawDpr > 1 ? Math.min(rawDpr, 1.5) : 1;
+      const widthChanged = this.width !== r.width || this.height !== r.height || this.dpr !== nextDpr;
+      this.dpr = nextDpr;
+      this.canvas.width = Math.round(r.width * this.dpr);
+      this.canvas.height = Math.round(r.height * this.dpr);
       this.width = r.width;
       this.height = r.height;
-      this.relayout();
+      if (widthChanged) this.relayout();
+      else this.invalidate();
     };
+    this.resizeCanvas = resize;
     resize();
     window.addEventListener('resize', resize);
+  }
+
+  refreshSize({ fit = false } = {}) {
+    if (this.resizeCanvas) this.resizeCanvas();
+    if (fit) this.fit();
+    else this.invalidate();
+  }
+
+  setPaused(paused) {
+    this.paused = !!paused;
+    if (!this.paused) this.invalidate();
   }
 
   // Pixels at the bottom of the canvas occluded by optional overlays.
@@ -252,54 +337,56 @@ class Graph {
 
   setupInput() {
     const c = this.canvas;
+    const flushHover = () => {
+      this.hoverFrame = 0;
+      const sp = this.pendingHoverPoint;
+      this.pendingHoverPoint = null;
+      if (!sp || this.dragging) return;
+      const p = this.screenToWorld(sp.x, sp.y);
+      const h = this.hit(p.x, p.y);
+      if (this.hitKey(this.hovered) !== this.hitKey(h)) {
+        this.hovered = h;
+        c.style.cursor = h ? 'pointer' : 'grab';
+        this.invalidate();
+      }
+    };
+    const queueHover = (sp) => {
+      this.pendingHoverPoint = sp;
+      if (this.hoverFrame) return;
+      this.hoverFrame = requestAnimationFrame(flushHover);
+    };
     c.addEventListener('mousedown', (e) => {
-      const p = this.screenToWorld(e.offsetX, e.offsetY);
+      const sp = this.eventPoint(e);
+      const p = this.screenToWorld(sp.x, sp.y);
       const hit = this.hit(p.x, p.y);
       this.didDrag = false;
       this.dragging = { mode: hit ? 'hit' : 'pan', hit };
-      this.lastMouse = { x: e.offsetX, y: e.offsetY };
+      this.lastMouse = sp;
       this.cameraEase = 0; // user is taking direct control
     });
     c.addEventListener('mousemove', (e) => {
-      const dx = e.offsetX - this.lastMouse.x;
-      const dy = e.offsetY - this.lastMouse.y;
-      this.lastMouse = { x: e.offsetX, y: e.offsetY };
+      const sp = this.eventPoint(e);
+      const dx = sp.x - this.lastMouse.x;
+      const dy = sp.y - this.lastMouse.y;
+      this.lastMouse = sp;
       if (this.dragging) {
         if (Math.abs(dx) + Math.abs(dy) > 1) this.didDrag = true;
         if (this.dragging.mode === 'pan') {
+          this.markInteracting();
           this.camera.x += dx / this.camera.zoom;
           this.camera.y += dy / this.camera.zoom;
           this.cameraTarget.x = this.camera.x;
           this.cameraTarget.y = this.camera.y;
           this.invalidate();
         }
-      } else if (this.hovered && this.hovered.kind === 'export') {
-        // Re-test in case mouse moved off the pill without other movement
-        const p = this.screenToWorld(e.offsetX, e.offsetY);
-        const h = this.hit(p.x, p.y);
-        if (this.hovered !== h) {
-          this.hovered = h;
-          this.invalidate();
-        }
       } else {
-        const p = this.screenToWorld(e.offsetX, e.offsetY);
-        const h = this.hit(p.x, p.y);
-        // Treat sections as hover-only (don't replace selection on click of header area unless explicit)
-        if (this.hovered !== h) {
-          if (h && h.kind === 'section') {
-            this.hovered = h;
-            c.style.cursor = 'pointer';
-          } else {
-            this.hovered = h;
-            c.style.cursor = h ? 'pointer' : 'grab';
-          }
-          this.invalidate();
-        }
+        queueHover(sp);
       }
     });
-    c.addEventListener('mouseup', () => {
+    c.addEventListener('mouseup', (e) => {
       if (this.dragging && !this.didDrag) {
-        const h = this.dragging.hit;
+        const p = this.eventToWorld(e);
+        const h = this.hit(p.x, p.y);
         if (h && h.kind === 'expand') {
           this.toggleSection(h.sectionKind);
         } else if (h && h.kind === 'table-toggle') {
@@ -319,7 +406,7 @@ class Graph {
     });
     c.addEventListener('contextmenu', (e) => {
       e.preventDefault();
-      const p = this.screenToWorld(e.offsetX, e.offsetY);
+      const p = this.eventToWorld(e);
       const h = this.hit(p.x, p.y);
       if (h) {
         this.selected = h;
@@ -331,6 +418,7 @@ class Graph {
     c.addEventListener('wheel', (e) => {
       e.preventDefault();
       this.cameraEase = 0;
+      this.markInteracting();
 
       // Cmd/Ctrl + wheel OR pinch (browsers report pinch with ctrlKey=true)
       // = zoom. Plain trackpad two-finger swipe = pan.
@@ -340,9 +428,10 @@ class Graph {
         // Normalize so both feel similar.
         const k = Math.abs(e.deltaY) > 50 ? 0.0012 : 0.012;
         const factor = Math.exp(-e.deltaY * k);
-        const before = this.screenToWorld(e.offsetX, e.offsetY);
+        const sp = this.eventPoint(e);
+        const before = this.screenToWorld(sp.x, sp.y);
         this.camera.zoom = Math.max(0.2, Math.min(4, this.camera.zoom * factor));
-        const after = this.screenToWorld(e.offsetX, e.offsetY);
+        const after = this.screenToWorld(sp.x, sp.y);
         this.camera.x += after.x - before.x;
         this.camera.y += after.y - before.y;
       } else {
@@ -357,7 +446,7 @@ class Graph {
       this.invalidate();
     }, { passive: false });
     c.addEventListener('dblclick', (e) => {
-      const p = this.screenToWorld(e.offsetX, e.offsetY);
+      const p = this.eventToWorld(e);
       const h = this.hit(p.x, p.y);
       if (h && h.kind === 'file') {
         this.zoomToNode(h.id);
@@ -409,6 +498,16 @@ class Graph {
     };
   }
 
+  eventPoint(e) {
+    const r = this.canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+
+  eventToWorld(e) {
+    const p = this.eventPoint(e);
+    return this.screenToWorld(p.x, p.y);
+  }
+
   visibleBounds() {
     return {
       minX: -this.camera.x - this.width / (2 * this.camera.zoom),
@@ -424,14 +523,16 @@ class Graph {
       return { kind: 'ai', id: '__ai__' };
     }
     // Export pills (only present when zoomed-in detail is rendered)
-    for (const [fileId, pills] of this.exportPills) {
-      for (const p of pills) {
+    const pillEntries = [...this.exportPills.entries()].reverse();
+    for (const [fileId, pills] of pillEntries) {
+      for (const p of pills.slice().reverse()) {
         if (wx >= p.x && wx <= p.x + p.w && wy >= p.y && wy <= p.y + p.h) {
           return { kind: 'export', fileId, name: p.name };
         }
       }
     }
-    for (const f of this.files.values()) {
+    for (let i = this.hitFiles.length - 1; i >= 0; i--) {
+      const f = this.hitFiles[i];
       if (f.hidden) continue;
       if (wx >= f.x && wx <= f.x + f.w && wy >= f.y && wy <= f.y + f.h) {
         // Tables: bottom 14px is the expand/collapse footer
@@ -441,8 +542,10 @@ class Graph {
         return { kind: 'file', id: f.id, label: f.label, fileKind: f.kind };
       }
     }
-    for (const L of this.layers) {
-      for (const s of L.sections) {
+    for (let li = this.layers.length - 1; li >= 0; li--) {
+      const L = this.layers[li];
+      for (let si = L.sections.length - 1; si >= 0; si--) {
+        const s = L.sections[si];
         if (wx >= s.x && wx <= s.x + s.w && wy >= s.y - 4 && wy <= s.y + 22) {
           return { kind: 'section', sectionKind: s.kind, label: s.name, files: s.files };
         }
@@ -452,6 +555,14 @@ class Graph {
       }
     }
     return null;
+  }
+
+  hitKey(h) {
+    if (!h) return '';
+    if (h.kind === 'file' || h.kind === 'table-toggle' || h.kind === 'ai') return `${h.kind}:${h.id || ''}`;
+    if (h.kind === 'section' || h.kind === 'expand') return `${h.kind}:${h.sectionKind || ''}`;
+    if (h.kind === 'export') return `export:${h.fileId || ''}:${h.name || ''}`;
+    return `${h.kind || ''}:${h.id || h.fileId || h.sectionKind || h.name || ''}`;
   }
 
   layerOfKind(kind) {
@@ -490,13 +601,12 @@ class Graph {
     ]);
     this.pulses = [];
     this.replaced = { removed: new Set(), added: new Set(), title: '' };
-    this.agentActivity.clear();
     this.searchQuery = '';
     this.matchSet.clear();
 
     for (const n of graphData.nodes) {
       const isExt = n.type === 'external';
-      this.files.set(n.id, {
+      const file = {
         id: n.id,
         filename: n.filename || n.id.split('/').pop(),
         label: n.label,
@@ -520,7 +630,12 @@ class Graph {
         dir: n.dir || (n.id.includes('/') ? n.id.slice(0, n.id.lastIndexOf('/')) : ''),
         x: 0, y: 0, w: 110, h: 24,
         glow: 0, lastTouched: 0,
-      });
+      };
+      file.searchText = this.searchTextFor(file);
+      this.files.set(n.id, file);
+    }
+    for (const id of [...this.agentActivity.keys()]) {
+      if (!this.files.has(id)) this.agentActivity.delete(id);
     }
     this.fileEdges = (graphData.edges || []).slice();
     for (const e of this.fileEdges) {
@@ -531,6 +646,7 @@ class Graph {
       e.isTransitive = !!e.transitive;
       e.dbOps = e.operations || [];
     }
+    this.rebuildEdgeIndexes();
 
     const visibleNonExternal = [...this.files.values()].filter(f => f.kind !== 'external');
     const currentlyVisible = visibleNonExternal.filter(f => this.visibleKinds.has(f.kind)).length;
@@ -620,8 +736,24 @@ class Graph {
   //   - Within each column, sections (Pages, Endpoints, Tables…) stack
   //     vertically. Within a section, items wrap into rows that fit the
   //     column's width.
+  refreshVisibleCaches() {
+    this.visibleFiles = [...this.files.values()].filter(f => !f.hidden);
+    this.hitFiles = this.visibleFiles.slice();
+    this.visibleEdges = (this.fileEdges || []).filter(e => {
+      const a = this.files.get(e.source);
+      const b = this.files.get(e.target);
+      return !!(a && b && !a.hidden && !b.hidden);
+    });
+  }
+
   relayout() {
-    if (!this.files.size) return;
+    if (!this.files.size) {
+      this.visibleFiles = [];
+      this.visibleEdges = [];
+      this.hitFiles = [];
+      return;
+    }
+    this.neighborhoodCache = null;
     const ctx = this.ctx;
     const topPad = (this.topOcclusion ? this.topOcclusion() : 80) + 24;
 
@@ -630,7 +762,8 @@ class Graph {
     for (const L of LAYER_DEFS) byLayer[L.id] = new Map();
     let visibleNodeCount = 0;
     for (const f of this.files.values()) {
-      if (!this.visibleKinds.has(f.kind)) { f.hidden = true; continue; }
+      const forceVisible = this.searchQuery && this.matchSet.has(f.id);
+      if (!this.visibleKinds.has(f.kind) && !forceVisible) { f.hidden = true; continue; }
       f.hidden = false;
       visibleNodeCount++;
       const lid = LAYER_OF_KIND[f.kind] || 'support';
@@ -710,7 +843,20 @@ class Graph {
         const cols = density === 'small'
           ? Math.min(3, Math.max(1, Math.ceil(Math.sqrt(Math.max(1, count)))))
           : 2;
-        return Math.ceil(Math.max(med * cols + ITEM_GAP * (cols - 1), p60 + 24) + 16);
+        const endpointGroups = new Map();
+        for (const f of buckets.get('endpoint') || []) {
+          const key = endpointPathOf(f);
+          if (!endpointGroups.has(key)) endpointGroups.set(key, []);
+          endpointGroups.get(key).push(f);
+        }
+        let groupedW = 0;
+        for (const group of endpointGroups.values()) {
+          if (group.length < 2) continue;
+          const compactW = 118;
+          const groupCols = Math.min(group.length, 4);
+          groupedW = Math.max(groupedW, compactW * groupCols + ITEM_GAP * (groupCols - 1));
+        }
+        return Math.ceil(Math.max(med * cols + ITEM_GAP * (cols - 1), p60 + 24, groupedW + 20) + 16);
       }
       if (lid === 'support') {
         const cols = density === 'small'
@@ -734,7 +880,11 @@ class Graph {
       .filter(L => byLayer[L.id] && byLayer[L.id].size)
       .map(L => ({ L, w: layerColWidth(L.id) }));
 
-    if (!activeLayers.length) { this.layers = []; return; }
+    if (!activeLayers.length) {
+      this.layers = [];
+      this.refreshVisibleCaches();
+      return;
+    }
 
     // ---- 4. Position columns side-by-side, centered around x=0 ----
     const totalW = activeLayers.reduce((s, x) => s + x.w, 0) + COL_GAP * (activeLayers.length - 1);
@@ -759,8 +909,15 @@ class Graph {
           if (k === 'table' && a.parentFile && b.parentFile && a.parentFile !== b.parentFile) {
             return a.parentFile.localeCompare(b.parentFile);
           }
-          if (k === 'endpoint' && a.parentFile && b.parentFile && a.parentFile !== b.parentFile) {
-            return a.parentFile.localeCompare(b.parentFile);
+          if (k === 'endpoint') {
+            const pa = endpointPathOf(a);
+            const pb = endpointPathOf(b);
+            if (pa !== pb) return pa.localeCompare(pb);
+            const va = endpointVerbRank(a);
+            const vb = endpointVerbRank(b);
+            if (va !== vb) return va - vb;
+            if (a.parentFile && b.parentFile && a.parentFile !== b.parentFile) return a.parentFile.localeCompare(b.parentFile);
+            return a.id.localeCompare(b.id);
           }
           const ia = this.importance.get(a.id) || 0;
           const ib = this.importance.get(b.id) || 0;
@@ -772,7 +929,17 @@ class Graph {
         const cap = ALWAYS_FULL.has(k) ? Infinity : adaptiveCap;
         const visibleCount = expanded ? allK.length : Math.min(cap, allK.length);
         const filesK = allK.slice(0, visibleCount);
-        const hiddenK = allK.slice(visibleCount);
+        if (this.searchQuery) {
+          const already = new Set(filesK.map(f => f.id));
+          for (const f of allK) {
+            if (this.matchSet.has(f.id) && !already.has(f.id)) {
+              filesK.push(f);
+              already.add(f.id);
+            }
+          }
+        }
+        const visibleIds = new Set(filesK.map(f => f.id));
+        const hiddenK = allK.filter(f => !visibleIds.has(f.id));
         for (const f of hiddenK) f.hidden = true;
 
         const section = {
@@ -792,9 +959,21 @@ class Graph {
         let rowY = headerY;
         let rowMaxBottom = rowY;
 
-        for (let i = 0; i < filesK.length; i++) {
-          const f = filesK[i];
-          // Width: use measured label width capped to PILL_MAX_W; tables take innerW
+        const placeNode = (f, w, h) => {
+          if (placeX + w > section.x + innerW && placeX !== section.x + 2) {
+            placeX = section.x + 2;
+            rowY = rowMaxBottom + ROW_GAP;
+          }
+          f.w = w;
+          f.h = h;
+          f.x = placeX;
+          f.y = rowY;
+          f.hidden = false;
+          placeX += w + ITEM_GAP;
+          rowMaxBottom = Math.max(rowMaxBottom, rowY + h);
+        };
+
+        const sizeDefaultNode = (f) => {
           let w, h;
           if (f.kind === 'table') {
             const cols = f.columns || [];
@@ -808,6 +987,9 @@ class Graph {
             w = innerW;                                   // tables fill column width
             h = headerH + visCols.length * rowH + (f._showFooter ? 24 : 8);
           } else {
+            f._endpointCompact = false;
+            f._endpointPath = '';
+            f._endpointVerb = '';
             const labelW = measureLabel(f, fontPills);
             // Nodes stay boxy, but labels are allowed to wrap before they
             // collide with neighboring boxes. Endpoints get one extra line
@@ -827,18 +1009,49 @@ class Graph {
             const minH = f.kind === 'endpoint' ? 48 : PILL_H;
             h = Math.max(minH, textH + 14 + endpointMetaH + Math.min(6, Math.log2(imp + 1) * 1.4));
           }
-          // Wrap to next row if it won't fit
-          if (placeX + w > section.x + innerW && placeX !== section.x + 2) {
-            placeX = section.x + 2;
-            rowY = rowMaxBottom + ROW_GAP;
+          return { w, h };
+        };
+
+        if (k === 'endpoint') {
+          const groups = [];
+          for (const f of filesK) {
+            const key = endpointPathOf(f);
+            const last = groups[groups.length - 1];
+            if (last && last.key === key) last.files.push(f);
+            else groups.push({ key, files: [f] });
           }
-          f.w = w;
-          f.h = h;
-          f.x = placeX;
-          f.y = rowY;
-          f.hidden = false;
-          placeX += w + ITEM_GAP;
-          rowMaxBottom = Math.max(rowMaxBottom, rowY + h);
+          for (const group of groups) {
+            if (group.files.length > 1) {
+              if (placeX !== section.x + 2) {
+                placeX = section.x + 2;
+                rowY = rowMaxBottom + ROW_GAP;
+              }
+              const minMethodW = 96;
+              const maxCols = Math.max(1, Math.floor((innerW + ITEM_GAP) / (minMethodW + ITEM_GAP)));
+              const cols = Math.max(1, Math.min(group.files.length, maxCols));
+              const compactW = Math.max(minMethodW, Math.min(132, Math.floor((innerW - ITEM_GAP * (cols - 1)) / cols)));
+              for (const f of group.files) {
+                f._endpointCompact = true;
+                f._endpointPath = group.key;
+                f._endpointVerb = endpointVerbOf(f) || 'API';
+                f._labelLines = [f._endpointVerb, group.key];
+                const imp = this.importance.get(f.id) || 0;
+                f._importance = imp;
+                placeNode(f, compactW, 52);
+              }
+              placeX = section.x + 2;
+              rowY = rowMaxBottom + ROW_GAP;
+            } else {
+              const f = group.files[0];
+              const box = sizeDefaultNode(f);
+              placeNode(f, box.w, box.h);
+            }
+          }
+        } else {
+          for (const f of filesK) {
+            const box = sizeDefaultNode(f);
+            placeNode(f, box.w, box.h);
+          }
         }
 
         section.h = (rowMaxBottom + (filesK.some(f => f.kind === 'table') ? 6 : 14)) - yCursor;
@@ -860,6 +1073,7 @@ class Graph {
     // AI is no longer rendered on the canvas
     this.aiNode.x = -99999;
     this.aiNode.y = -99999;
+    this.refreshVisibleCaches();
     this.invalidate();
   }
 
@@ -913,43 +1127,100 @@ class Graph {
     this.relayout();
   }
 
+  // Cheap incremental graph mutations driven by the file-watcher.
+  // - removeFile: drop a node + every edge touching it, then re-layout.
+  // - addFileStub: insert a placeholder so a freshly-created file appears in
+  //   the diagram immediately (it'll be replaced with full metadata on the
+  //   next scan).
+  removeFile(id) {
+    if (!this.files.has(id)) return false;
+    this.files.delete(id);
+    if (this.fileEdges) {
+      this.fileEdges = this.fileEdges.filter(e => e.source !== id && e.target !== id);
+    }
+    this.rebuildEdgeIndexes();
+    if (this.importance) this.importance.delete(id);
+    if (this.exportConsumers) {
+      for (const k of [...this.exportConsumers.keys()]) {
+        if (k.startsWith(id + '|')) this.exportConsumers.delete(k);
+        else this.exportConsumers.get(k)?.delete(id);
+      }
+    }
+    if (this.agentActivity) this.agentActivity.delete(id);
+    if (this.selected && this.selected.id === id) this.selected = null;
+    if (this.hovered && this.hovered.id === id) this.hovered = null;
+    this.relayout();
+    this.invalidate();
+    return true;
+  }
+
+  addFileStub(id, hint = {}) {
+    if (this.files.has(id)) return false;
+    const baseName = id.split('/').pop();
+    const file = {
+      id,
+      filename: baseName,
+      label: hint.label || baseName,
+      sublabel: hint.sublabel || '',
+      kind: hint.kind || 'module',
+      methods: null,
+      exports: [],
+      importsRefs: [],
+      columns: null,
+      parentFile: null,
+      deadApiCalls: null,
+      ext: hint.ext || ('.' + (baseName.split('.').pop() || '')),
+      size: 0,
+      dir: id.includes('/') ? id.slice(0, id.lastIndexOf('/')) : '',
+      x: 0, y: 0, w: 110, h: 24,
+      glow: 0, lastTouched: 0,
+    };
+    file.searchText = this.searchTextFor(file);
+    this.files.set(id, file);
+    this.relayout();
+    this.invalidate();
+    return true;
+  }
+
+  searchTextFor(f) {
+    let aliases = f.kind === 'table'
+      ? ' sql database db table data read write insert update delete'
+      : f.kind === 'schema'
+        ? ' sql database schema migration data'
+        : f.kind === 'model'
+          ? ' database db model entity orm data'
+          : f.kind === 'infra'
+            ? ' docker terraform deploy deployment infra infrastructure vercel netlify compose'
+            : f.kind === 'job'
+              ? ' job worker queue cron background script'
+              : f.kind === 'service'
+                ? ' service server backend api process daemon'
+                : f.kind === 'endpoint'
+          ? ' api endpoint route server http get post put patch delete'
+          : '';
+    if (f.gitStatus && f.gitStatus.dirty) aliases += ' git dirty changed uncommitted modified';
+    if (f.kind === 'table' && f.sqlStats) {
+      if (f.sqlStats.read) aliases += ' reads read';
+      if (f.sqlStats.write) aliases += ' writes write mutation changed';
+      if (f.sqlStats.insert) aliases += ' insert';
+      if (f.sqlStats.update) aliases += ' update';
+      if (f.sqlStats.delete) aliases += ' delete';
+    }
+    return `${this.displayLabel(f)} ${f.id} ${f.kind}${aliases}`.toLowerCase();
+  }
+
   setSearch(q) {
     this.searchQuery = (q || '').trim().toLowerCase();
     this.matchSet.clear();
     if (!this.searchQuery) {
-      this.invalidate();
+      this.relayout();
       return;
     }
     const q2 = this.searchQuery;
     for (const f of this.files.values()) {
-      if (f.hidden) continue;
-      let aliases = f.kind === 'table'
-        ? ' sql database db table data read write insert update delete'
-        : f.kind === 'schema'
-          ? ' sql database schema migration data'
-          : f.kind === 'model'
-            ? ' database db model entity orm data'
-            : f.kind === 'infra'
-              ? ' docker terraform deploy deployment infra infrastructure vercel netlify compose'
-              : f.kind === 'job'
-                ? ' job worker queue cron background script'
-                : f.kind === 'service'
-                  ? ' service server backend api process daemon'
-                  : f.kind === 'endpoint'
-          ? ' api endpoint route server http get post put patch delete'
-          : '';
-      if (f.gitStatus && f.gitStatus.dirty) aliases += ' git dirty changed uncommitted modified';
-      if (f.kind === 'table' && f.sqlStats) {
-        if (f.sqlStats.read) aliases += ' reads read';
-        if (f.sqlStats.write) aliases += ' writes write mutation changed';
-        if (f.sqlStats.insert) aliases += ' insert';
-        if (f.sqlStats.update) aliases += ' update';
-        if (f.sqlStats.delete) aliases += ' delete';
-      }
-      const text = `${this.displayLabel(f)} ${f.id} ${f.kind}${aliases}`.toLowerCase();
-      if (text.includes(q2)) this.matchSet.add(f.id);
+      if ((f.searchText || this.searchTextFor(f)).includes(q2)) this.matchSet.add(f.id);
     }
-    this.invalidate();
+    this.relayout();
   }
 
   isFlowEdge(e) {
@@ -961,10 +1232,50 @@ class Graph {
     );
   }
 
+  addEdgeIndex(map, key, edge) {
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(edge);
+  }
+
+  rebuildEdgeIndexes() {
+    this.edgesBySource = new Map();
+    this.edgesByTarget = new Map();
+    this.flowEdgesBySource = new Map();
+    this.flowEdgesByTarget = new Map();
+    for (const e of this.fileEdges || []) {
+      this.addEdgeIndex(this.edgesBySource, e.source, e);
+      this.addEdgeIndex(this.edgesByTarget, e.target, e);
+      if (this.isFlowEdge(e)) {
+        this.addEdgeIndex(this.flowEdgesBySource, e.source, e);
+        this.addEdgeIndex(this.flowEdgesByTarget, e.target, e);
+      }
+    }
+    this.neighborhoodCache = null;
+  }
+
+  edgesForNodeSet(ids) {
+    if (!ids || !ids.size) return [];
+    const out = [];
+    const seen = new Set();
+    const add = (edges) => {
+      for (const e of edges || []) {
+        if (seen.has(e.id)) continue;
+        seen.add(e.id);
+        out.push(e);
+      }
+    };
+    for (const id of ids) {
+      add(this.edgesBySource.get(id));
+      add(this.edgesByTarget.get(id));
+    }
+    return out;
+  }
+
   // End-to-end neighborhood for hover/select highlighting. This follows the
   // real app flow across frontend callers, endpoints, SQL tables, and endpoint
   // internals instead of stopping at one hop.
   neighborhood(id) {
+    if (this.neighborhoodCache && this.neighborhoodCache.id === id) return this.neighborhoodCache.set;
     const set = new Set([id]);
     const edgeBudget = 260;
     let used = 0;
@@ -974,10 +1285,10 @@ class Graph {
       while (q.length && used < edgeBudget) {
         const cur = q.shift();
         if (cur.depth >= 5) continue;
-        for (const e of this.fileEdges) {
-          if (!this.isFlowEdge(e)) continue;
-          const matches = dir === 'out' ? e.source === cur.id : e.target === cur.id;
-          if (!matches) continue;
+        const edges = dir === 'out'
+          ? (this.flowEdgesBySource.get(cur.id) || [])
+          : (this.flowEdgesByTarget.get(cur.id) || []);
+        for (const e of edges) {
           const next = dir === 'out' ? e.target : e.source;
           const nf = this.files.get(next);
           if (!nf || nf.hidden) continue;
@@ -995,11 +1306,13 @@ class Graph {
 
     // Keep immediate imports too, so regular file dependencies still light up,
     // but do not recursively import-walk the whole repo.
-    for (const e of this.fileEdges) {
-      if (e.type !== 'import' && e.type !== 'external') continue;
-      if (e.source === id) set.add(e.target);
-      if (e.target === id) set.add(e.source);
+    for (const e of this.edgesBySource.get(id) || []) {
+      if (e.type === 'import' || e.type === 'external') set.add(e.target);
     }
+    for (const e of this.edgesByTarget.get(id) || []) {
+      if (e.type === 'import' || e.type === 'external') set.add(e.source);
+    }
+    this.neighborhoodCache = { id, set };
     return set;
   }
 
@@ -1011,9 +1324,9 @@ class Graph {
       if (f.kind === sectionKind && !f.hidden) inSection.add(f.id);
     }
     for (const id of inSection) set.add(id);
-    for (const e of this.fileEdges) {
-      if (inSection.has(e.source)) set.add(e.target);
-      if (inSection.has(e.target)) set.add(e.source);
+    for (const id of inSection) {
+      for (const e of this.edgesBySource.get(id) || []) set.add(e.target);
+      for (const e of this.edgesByTarget.get(id) || []) set.add(e.source);
     }
     return set;
   }
@@ -1022,8 +1335,19 @@ class Graph {
     const f = this.files.get(targetId);
     if (!f) return;
     const now = performance.now();
-    f.glow = kind === 'edit' ? 1.25 : 0.9;
+    // Reads flash briefly; writes hold for ~1.5s so you don't miss them.
+    // glowHoldUntil suppresses decay until that time has passed.
+    if (kind === 'edit') {
+      f.glow = 1.4;
+      f.glowDecay = 0.965;             // slower fade after hold
+      f.glowHoldUntil = now + 1500;    // 1.5s hold at full brightness
+    } else {
+      f.glow = 0.9;
+      f.glowDecay = 0.985;             // quick fade
+      f.glowHoldUntil = now + 120;     // brief flash
+    }
     f.lastTouched = now;
+    this.activeGlowIds.add(targetId);
     if (agent && agent.agentId) {
       let byAgent = this.agentActivity.get(targetId);
       if (!byAgent) {
@@ -1042,14 +1366,6 @@ class Graph {
       const ordered = [...byAgent.entries()].sort((a, b) => b[1].last - a[1].last);
       for (const [oldId] of ordered.slice(6)) byAgent.delete(oldId);
     }
-    this.pulses.push({
-      fromX: this.aiNode.x, fromY: this.aiNode.y,
-      toX: f.x + f.w / 2, toY: f.y + f.h / 2,
-      start: now,
-      duration: kind === 'edit' ? 1500 : 1000,
-      kind,
-    });
-    if (this.pulses.length > 30) this.pulses.splice(0, this.pulses.length - 30);
     this.invalidate();
   }
 
@@ -1102,12 +1418,29 @@ class Graph {
   get modules() { return new Map(); }
 
   frame() {
+    this.frameScheduled = false;
+    if (this.paused) {
+      return;
+    }
     const now = performance.now();
-    let animating = this.cameraEase > 0 || this.pulses.length > 0;
-    for (const f of this.files.values()) {
+    let animating = this.cameraEase > 0;
+    for (const id of this.activeGlowIds) {
+      const f = this.files.get(id);
+      if (!f) {
+        this.activeGlowIds.delete(id);
+        continue;
+      }
       if (f.glow > 0.05) {
-        f.glow *= 0.99;
+        // Hold the glow at full brightness until glowHoldUntil expires,
+        // then decay using the per-touch decay rate.
+        if (!f.glowHoldUntil || now >= f.glowHoldUntil) {
+          f.glow *= (f.glowDecay != null ? f.glowDecay : 0.985);
+        }
         animating = true;
+      } else {
+        f.glow = 0;
+        this.activeGlowIds.delete(id);
+        this.needsDraw = true;
       }
     }
     // Smooth camera toward target when easing is on (e.g. after fit/panTo)
@@ -1130,7 +1463,7 @@ class Graph {
       this.draw(now);
       this.needsDraw = false;
     }
-    requestAnimationFrame(() => this.frame());
+    if (animating || this.needsDraw) this.scheduleFrame();
   }
 
   // ===== Rendering =====
@@ -1147,6 +1480,7 @@ class Graph {
       this.dpr * (this.height / 2 + this.camera.y * z)
     );
 
+    const fastMode = now < (this.fastUntil || 0);
     const focusId = this.selected && this.selected.kind === 'file' ? this.selected.id : null;
     const hoverId = this.hovered && this.hovered.kind === 'file' ? this.hovered.id : null;
     const activeId = hoverId || focusId;
@@ -1159,7 +1493,9 @@ class Graph {
     // just (focused file + that export's consumers) so the user sees ONLY who
     // uses that one function.
     let activeNeighborhood;
-    if (hoveredExport) {
+    if (fastMode) {
+      activeNeighborhood = null;
+    } else if (hoveredExport) {
       const consumers = this.exportConsumers.get(`${hoveredExport.fileId}|${hoveredExport.name}`);
       activeNeighborhood = new Set([hoveredExport.fileId, ...(consumers || [])]);
     } else if (activeId) {
@@ -1175,16 +1511,15 @@ class Graph {
 
     const vb = this.visibleBounds();
     const inView = (x, y, w, h) => !(x + w < vb.minX || x > vb.maxX || y + h < vb.minY || y > vb.maxY);
-    // For an edge between a and b, compute the union of their boxes — that's
-    // the actual bbox the line passes through. Using only one node's width
-    // (as the old code did) under-estimated cross-column edges and culled
-    // them.
-    const edgeBox = (a, b) => {
+    // For an edge between a and b, cull by the union of their boxes — that's
+    // the actual bbox the line passes through. Keep this allocation-free in
+    // the draw loop; large repos can have thousands of edges.
+    const edgeInView = (a, b) => {
       const minX = Math.min(a.x, b.x);
       const minY = Math.min(a.y, b.y);
       const maxX = Math.max(a.x + a.w, b.x + b.w);
       const maxY = Math.max(a.y + a.h, b.y + b.h);
-      return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+      return !(maxX < vb.minX || minX > vb.maxX || maxY < vb.minY || minY > vb.maxY);
     };
 
     // ----- Section headers (cthdrl: ghost-sand mono labels, thin rules) -----
@@ -1248,71 +1583,72 @@ class Graph {
     //   api-call            → dashed, bright (always)
     const anyActive = !!(activeNeighborhood || isSearching);
     let drawCount = { api: 0, fk: 0, dbq: 0, internal: 0, imp: 0, skipped: 0, total: 0 };
-    for (const e of this.fileEdges) {
-      drawCount.total++;
-      const a = this.files.get(e.source);
-      const b = this.files.get(e.target);
-      if (!a || !b || a.hidden || b.hidden) { drawCount.skipped++; continue; }
-      const box = edgeBox(a, b);
-      if (!inView(box.x, box.y, box.w, box.h)) { drawCount.skipped++; continue; }
-      if (e.isApiCall) drawCount.api++;
-      else if (e.isFk) drawCount.fk++;
-      else if (e.isDbQuery) drawCount.dbq++;
-      else if (e.isEndpointInternal) drawCount.internal++;
-      else drawCount.imp++;
+    if (!fastMode) {
+      for (const e of this.visibleEdges) {
+        drawCount.total++;
+        const a = this.files.get(e.source);
+        const b = this.files.get(e.target);
+        if (!a || !b) { drawCount.skipped++; continue; }
+        if (!edgeInView(a, b)) { drawCount.skipped++; continue; }
+        if (e.isApiCall) drawCount.api++;
+        else if (e.isFk) drawCount.fk++;
+        else if (e.isDbQuery) drawCount.dbq++;
+        else if (e.isEndpointInternal) drawCount.internal++;
+        else drawCount.imp++;
 
-      const isHighlighted =
-        (activeNeighborhood && activeNeighborhood.has(a.id) && activeNeighborhood.has(b.id)) ||
-        (isSearching && (this.matchSet.has(a.id) || this.matchSet.has(b.id)));
-      if (isHighlighted) continue;
+        const isHighlighted =
+          (activeNeighborhood && activeNeighborhood.has(a.id) && activeNeighborhood.has(b.id)) ||
+          (isSearching && (this.matchSet.has(a.id) || this.matchSet.has(b.id)));
+        if (isHighlighted) continue;
 
-      const crossKind = a.kind !== b.kind;
-      const aLayer = LAYER_OF_KIND[a.kind] || 'support';
-      const bLayer = LAYER_OF_KIND[b.kind] || 'support';
-      const crossLayer = aLayer !== bLayer;
-      let alpha, lineW, dashed = false;
-      if (e.isFk) {
-        alpha = anyActive ? 0.08 : 0.28;
-        lineW = 0.9 / z;
-      } else if (e.isDbQuery) {
-        // Endpoint → Table: clearly distinct from imports
-        alpha = anyActive ? 0.08 : 0.30;
-        lineW = 0.9 / z;
-        dashed = true;
-      } else if (e.isEndpointInternal) {
-        alpha = anyActive ? 0.04 : 0.14;
-        lineW = 0.9 / z;
-        dashed = true;
-      } else if (e.isApiCall) {
-        // Page/Component/Hook/Store → Endpoint flow. Keep passive flows quiet;
-        // active selection/hover redraws them on top later.
-        const direct = !e.isTransitive;
-        alpha = anyActive ? 0.045 : (direct ? 0.34 : 0.16);
-        lineW = (direct ? 1.0 : 0.75) / z;
-        dashed = true;
-      } else if (crossLayer) {
-        // Any non-api edge that crosses architectural layers
-        alpha = anyActive ? 0.04 : 0.18;
-        lineW = 0.8 / z;
-      } else if (crossKind) {
-        // Within same layer, between kinds (e.g. Page→Component)
-        alpha = anyActive ? 0.03 : 0.12;
-        lineW = 0.7 / z;
-      } else {
-        alpha = anyActive ? 0.015 : 0.045;
-        lineW = 0.6 / z;
+        const crossKind = a.kind !== b.kind;
+        const aLayer = LAYER_OF_KIND[a.kind] || 'support';
+        const bLayer = LAYER_OF_KIND[b.kind] || 'support';
+        const crossLayer = aLayer !== bLayer;
+        let alpha, lineW, dashed = false;
+        if (e.isFk) {
+          alpha = anyActive ? 0.08 : 0.28;
+          lineW = 0.9 / z;
+        } else if (e.isDbQuery) {
+          // Endpoint → Table: clearly distinct from imports
+          alpha = anyActive ? 0.08 : 0.30;
+          lineW = 0.9 / z;
+          dashed = true;
+        } else if (e.isEndpointInternal) {
+          alpha = anyActive ? 0.04 : 0.14;
+          lineW = 0.9 / z;
+          dashed = true;
+        } else if (e.isApiCall) {
+          // Page/Component/Hook/Store → Endpoint flow. Keep passive flows quiet;
+          // active selection/hover redraws them on top later.
+          const direct = !e.isTransitive;
+          alpha = anyActive ? 0.045 : (direct ? 0.34 : 0.16);
+          lineW = (direct ? 1.0 : 0.75) / z;
+          dashed = true;
+        } else if (crossLayer) {
+          // Any non-api edge that crosses architectural layers
+          alpha = anyActive ? 0.04 : 0.18;
+          lineW = 0.8 / z;
+        } else if (crossKind) {
+          // Within same layer, between kinds (e.g. Page→Component)
+          alpha = anyActive ? 0.03 : 0.12;
+          lineW = 0.7 / z;
+        } else {
+          alpha = anyActive ? 0.015 : 0.045;
+          lineW = 0.6 / z;
+        }
+        // Edge color = source kind tint, with sand fallback
+        ctx.strokeStyle = tintRGB(a.kind, alpha);
+        ctx.lineWidth = lineW;
+        if (dashed) ctx.setLineDash([5 / z, 4 / z]);
+        this.drawEdge(ctx, a, b, false, e);
+        if (dashed) ctx.setLineDash([]);
       }
-      // Edge color = source kind tint, with sand fallback
-      ctx.strokeStyle = tintRGB(a.kind, alpha);
-      ctx.lineWidth = lineW;
-      if (dashed) ctx.setLineDash([5 / z, 4 / z]);
-      this.drawEdge(ctx, a, b, false, e);
-      if (dashed) ctx.setLineDash([]);
     }
 
     // ----- Nodes -----
-    for (const f of this.files.values()) {
-      if (f.hidden || !inView(f.x, f.y, f.w, f.h)) continue;
+    for (const f of this.visibleFiles) {
+      if (!inView(f.x, f.y, f.w, f.h)) continue;
       const isSel = focusId === f.id;
       const isHover = hoverId === f.id;
       const inHood = activeNeighborhood && activeNeighborhood.has(f.id);
@@ -1322,7 +1658,7 @@ class Graph {
       // Tables render as ER cards
       if (f.kind === 'table') {
         const tableDimmed = (isSearching && !isMatch) || (activeId && !inHood && !isSearching);
-        this.drawTableCard(ctx, f, { isSel, isHover, dimmed: tableDimmed, isMatch, z, vb });
+        this.drawTableCard(ctx, f, { isSel, isHover, dimmed: tableDimmed, isMatch, z, vb, fast: fastMode });
         continue;
       }
 
@@ -1382,40 +1718,56 @@ class Graph {
 
       // Label — proportional to the box. At very distant zoom levels the
       // graph becomes structural blocks; text returns as the user opens it up.
-      const showLabel = (f.kind === 'endpoint' && z >= 0.20) ||
+      const showLabel = (
+        (f.kind === 'endpoint' && z >= 0.20) ||
         z >= this.OVERVIEW_LABEL_ZOOM ||
-        isSel || isHover || isMatch;
+        isSel || isHover || isMatch
+      );
       if (showLabel) {
         ctx.fillStyle = isSel ? INVERT_TEXT : `rgba(${SAND}, ${dimmed ? 0.55 : 0.95})`;
-        ctx.font = `400 12px ${FONT_MONO}`;
         ctx.textAlign = 'left';
         ctx.textBaseline = 'middle';
-        const lines = f._labelLines && f._labelLines.length ? f._labelLines : [this.displayLabel(f)];
-        const lineH = 14;
-        const blockH = lines.length * lineH;
-        const metaH = f.kind === 'endpoint' ? 15 : 0;
-        const labelAreaH = f.h - metaH;
-        const startY = f.y + labelAreaH / 2 - blockH / 2 + lineH / 2;
-        const labelMaxW = f.w - 18;
-        for (let i = 0; i < lines.length; i++) {
-          const written = ctx.measureText(lines[i]).width <= labelMaxW
-            ? lines[i]
-            : this.truncate(ctx, lines[i], labelMaxW);
-          ctx.fillText(written, f.x + 12, startY + i * lineH + 0.5);
-        }
-        if (f.kind === 'endpoint') {
+        if (f.kind === 'endpoint' && f._endpointCompact) {
           const st = f.endpointStats || { ui: 0, backend: 0, db: 0, internal: 0 };
-          const meta = `UI ${st.ui} · API ${st.backend} · DB ${st.db} · USES ${st.internal}`;
+          const verb = f._endpointVerb || endpointVerbOf(f) || 'API';
+          const path = f._endpointPath || endpointPathOf(f);
+          ctx.font = `400 12px ${FONT_MONO}`;
+          ctx.fillText(this.truncate(ctx, verb, f.w - 18), f.x + 10, f.y + 14);
           ctx.font = `400 10px ${FONT_MONO}`;
-          ctx.fillStyle = isSel ? INVERT_TEXT : tintRGB(f.kind, dimmed ? 0.5 : 0.82);
-          ctx.textBaseline = 'middle';
-          ctx.fillText(this.truncate(ctx, meta, f.w - 18), f.x + 12, f.y + f.h - 9);
+          ctx.fillStyle = isSel ? INVERT_TEXT : `rgba(${SAND}, ${dimmed ? 0.42 : 0.72})`;
+          ctx.fillText(this.truncate(ctx, path, f.w - 18), f.x + 10, f.y + 29);
+          const meta = `UI ${st.ui} DB ${st.db}`;
+          ctx.fillStyle = isSel ? INVERT_TEXT : tintRGB(f.kind, dimmed ? 0.45 : 0.78);
+          ctx.fillText(this.truncate(ctx, meta, f.w - 18), f.x + 10, f.y + f.h - 9);
+        } else {
+          ctx.font = `400 12px ${FONT_MONO}`;
+          const lines = f._labelLines && f._labelLines.length ? f._labelLines : [this.displayLabel(f)];
+          const lineH = 14;
+          const blockH = lines.length * lineH;
+          const metaH = f.kind === 'endpoint' ? 15 : 0;
+          const labelAreaH = f.h - metaH;
+          const startY = f.y + labelAreaH / 2 - blockH / 2 + lineH / 2;
+          const labelMaxW = f.w - 18;
+          for (let i = 0; i < lines.length; i++) {
+            const written = ctx.measureText(lines[i]).width <= labelMaxW
+              ? lines[i]
+              : this.truncate(ctx, lines[i], labelMaxW);
+            ctx.fillText(written, f.x + 12, startY + i * lineH + 0.5);
+          }
+          if (f.kind === 'endpoint') {
+            const st = f.endpointStats || { ui: 0, backend: 0, db: 0, internal: 0 };
+            const meta = `UI ${st.ui} · API ${st.backend} · DB ${st.db} · USES ${st.internal}`;
+            ctx.font = `400 10px ${FONT_MONO}`;
+            ctx.fillStyle = isSel ? INVERT_TEXT : tintRGB(f.kind, dimmed ? 0.5 : 0.82);
+            ctx.textBaseline = 'middle';
+            ctx.fillText(this.truncate(ctx, meta, f.w - 18), f.x + 12, f.y + f.h - 9);
+          }
         }
       }
 
       // Dead-call badge — small "!N" on the right edge for files with
       // unresolved API calls.
-      if (f.deadApiCalls && f.deadApiCalls.length) {
+      if (!fastMode && f.deadApiCalls && f.deadApiCalls.length) {
         const badge = `! ${f.deadApiCalls.length}`;
         ctx.font = `400 10px ${FONT_MONO}`;
         const tw = ctx.measureText(badge).width;
@@ -1426,29 +1778,33 @@ class Graph {
         ctx.fillStyle = INVERT_TEXT;
         ctx.fillText(badge, bx, by + 9);
       }
-      this.drawMapBadges(ctx, f, { z, dimmed, selectedLike: isSel || isHover || isMatch || inHood });
+      if (!fastMode) this.drawMapBadges(ctx, f, { z, dimmed, selectedLike: isSel || isHover || isMatch || inHood });
     }
 
     // Highlighted edges are the only lines allowed above boxes. Passive lines
     // stay behind the node fills so labels and SQL cards remain readable.
-    for (const e of this.fileEdges) {
-      const a = this.files.get(e.source);
-      const b = this.files.get(e.target);
-      if (!a || !b || a.hidden || b.hidden) continue;
-      const box = edgeBox(a, b);
-      if (!inView(box.x, box.y, box.w, box.h)) continue;
-      const isHighlighted =
-        (activeNeighborhood && activeNeighborhood.has(a.id) && activeNeighborhood.has(b.id)) ||
-        (isSearching && (this.matchSet.has(a.id) || this.matchSet.has(b.id)));
-      if (!isHighlighted) continue;
-      ctx.strokeStyle = tintRGB(a.kind, 0.95);
-      ctx.lineWidth = 1.8 / z;
-      if (e.isApiCall || e.isDbQuery || e.isEndpointInternal) ctx.setLineDash([5 / z, 4 / z]);
-      this.drawEdge(ctx, a, b, true, e);
-      if (e.isApiCall || e.isDbQuery || e.isEndpointInternal) ctx.setLineDash([]);
-      if (e.isDbQuery) {
-        const label = this.dbOpsLabel(e);
-        if (label) this.drawEdgeLabel(ctx, a, b, label, z, tintRGB('table', 0.95));
+    if (!fastMode) {
+      const highlightCandidates = activeNeighborhood && !isSearching
+        ? this.edgesForNodeSet(activeNeighborhood)
+        : this.visibleEdges;
+      for (const e of highlightCandidates) {
+        const a = this.files.get(e.source);
+        const b = this.files.get(e.target);
+        if (!a || !b || a.hidden || b.hidden) continue;
+        if (!edgeInView(a, b)) continue;
+        const isHighlighted =
+          (activeNeighborhood && activeNeighborhood.has(a.id) && activeNeighborhood.has(b.id)) ||
+          (isSearching && (this.matchSet.has(a.id) || this.matchSet.has(b.id)));
+        if (!isHighlighted) continue;
+        ctx.strokeStyle = tintRGB(a.kind, 0.95);
+        ctx.lineWidth = 1.8 / z;
+        if (e.isApiCall || e.isDbQuery || e.isEndpointInternal) ctx.setLineDash([5 / z, 4 / z]);
+        this.drawEdge(ctx, a, b, true, e);
+        if (e.isApiCall || e.isDbQuery || e.isEndpointInternal) ctx.setLineDash([]);
+        if (e.isDbQuery) {
+          const label = this.dbOpsLabel(e);
+          if (label) this.drawEdgeLabel(ctx, a, b, label, z, tintRGB('table', 0.95));
+        }
       }
     }
 
@@ -1456,7 +1812,7 @@ class Graph {
     // Renders a panel of the focused file's exports right next to its box.
     // For each export with consumers, a line is drawn from the pill to every
     // file that imports that name. Hover an export to filter to just it.
-    if (focusId && z >= this.DETAIL_ZOOM) {
+    if (!fastMode && focusId && z >= this.DETAIL_ZOOM) {
       const f = this.files.get(focusId);
       if (f && !f.hidden && f.exports && f.exports.length) {
         const pills = this.layoutExportPills(f, ctx);
@@ -1731,7 +2087,7 @@ class Graph {
   // ER-style table card: header bar (subtle), column rows below.
   // Visually consistent with other cthdrl cards — black bg, 1px sand stroke,
   // monospace text. Header is set apart by a horizontal rule, not a fill.
-  drawTableCard(ctx, f, { isSel, isHover, dimmed, isMatch, z, vb }) {
+  drawTableCard(ctx, f, { isSel, isHover, dimmed, isMatch, z, vb, fast = false }) {
     const headerH = 26, rowH = 17;
     const baseAlpha = dimmed ? 0.58 : 1;
     const overview = z < this.TABLE_DETAIL_ZOOM && !isSel && !isHover && !isMatch;
@@ -1746,6 +2102,21 @@ class Graph {
     ctx.fillRect(f.x, f.y, f.w, f.h);
     ctx.fillStyle = tintRGB('table', dimmed ? 0.42 : 0.95);
     ctx.fillRect(f.x, f.y, 4 / z, f.h);
+
+    if (fast) {
+      ctx.fillStyle = tintRGB('table', dimmed ? 0.72 : 1);
+      ctx.font = `400 13px ${FONT_MONO}`;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      const tableLbl = (f.label || '').toUpperCase();
+      ctx.fillText(this.truncate(ctx, tableLbl, f.w - 20), f.x + 10, f.y + Math.min(f.h - 12, headerH / 2 + 0.5));
+      ctx.strokeStyle = tintRGB('table', isSel || isHover || isMatch ? 0.95 : (dimmed ? 0.16 : 0.42));
+      ctx.lineWidth = (isSel || isHover ? 1.4 : 1) / z;
+      ctx.strokeRect(f.x, f.y, f.w, f.h);
+      this.drawAgentActivity(ctx, f, { z, dimmed, selectedLike: isSel || isHover || isMatch });
+      ctx.globalAlpha = 1;
+      return;
+    }
 
     // Header text — sand, mono, uppercase
     ctx.fillStyle = tintRGB('table', dimmed ? 0.72 : 1);
@@ -2001,10 +2372,17 @@ class Graph {
   }
 
   truncate(ctx, text, maxW) {
-    if (ctx.measureText(text).width <= maxW) return text;
-    let s = text;
-    while (s.length > 3 && ctx.measureText(s + '…').width > maxW) s = s.slice(0, -1);
-    return s + '…';
+    const raw = String(text || '');
+    if (!raw) return '';
+    if (ctx.measureText(raw).width <= maxW) return raw;
+    let lo = 1;
+    let hi = raw.length;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (ctx.measureText(raw.slice(0, mid) + '…').width <= maxW) lo = mid;
+      else hi = mid - 1;
+    }
+    return raw.slice(0, Math.max(1, lo)) + '…';
   }
 
   wrapLabel(ctx, text, maxW, maxLines = 2) {

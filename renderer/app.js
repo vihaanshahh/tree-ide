@@ -37,6 +37,9 @@ const canvas = $('#graph-canvas');
 const graph = new Graph(canvas);
 window.__treeGraph = graph;
 
+const VIEW_STORAGE_KEY = 'tree-ide-view';
+const RECENT_STORAGE_KEY = 'tree-ide-recents';
+const MAX_RECENT_REPOS = 12;
 const state = {
   root: null,
   files: [],
@@ -44,6 +47,11 @@ const state = {
   selected: null,       // { kind: 'module'|'file'|'ai', ... }
   running: false,
   pendingPlan: null,    // last swap plan: { moduleKey, replacement, removed, added, body }
+  view: 'graph',
+  graphStale: false,
+  agents: new Map(),
+  primaryAgentId: null,
+  activeAgentId: null,
 };
 
 const AGENT_COLORS = [
@@ -54,12 +62,84 @@ const AGENT_COLORS = [
   'hsl(98, 58%, 50%)',
   'hsl(268, 68%, 64%)',
 ];
+const EXTERNAL_WRITE_META = { agentId: '__external__', label: 'External', color: 'hsl(8, 72%, 62%)' };
+const AGENT_WRITE_WINDOW_MS = 15000;
 
 function shortTargetName(target) {
   if (!target) return '';
   const clean = String(target).replace(/^file:/, '');
   const parts = clean.split('/');
   return parts[parts.length - 1] || clean;
+}
+
+function getRecentRepos() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(RECENT_STORAGE_KEY) || '[]');
+    return Array.isArray(raw) ? raw.filter(p => typeof p === 'string' && p.trim()) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveRecentRepos(paths) {
+  const seen = new Set();
+  const clean = [];
+  for (const p of paths) {
+    if (!p || seen.has(p)) continue;
+    seen.add(p);
+    clean.push(p);
+    if (clean.length >= MAX_RECENT_REPOS) break;
+  }
+  localStorage.setItem(RECENT_STORAGE_KEY, JSON.stringify(clean));
+}
+
+function addRecentRepo(repoPath) {
+  if (!repoPath) return;
+  saveRecentRepos([repoPath, ...getRecentRepos().filter(p => p !== repoPath)]);
+  renderRecentRepos();
+}
+
+function clearRecentRepos() {
+  localStorage.removeItem(RECENT_STORAGE_KEY);
+  renderRecentRepos();
+}
+
+function renderRecentList(container, recents, { compact = false } = {}) {
+  if (!container) return;
+  container.innerHTML = '';
+  if (!recents.length) {
+    const empty = document.createElement('div');
+    empty.className = 'recent-empty';
+    empty.textContent = 'No recent repos';
+    container.appendChild(empty);
+    return;
+  }
+  for (const repoPath of recents) {
+    const btn = document.createElement('button');
+    btn.className = 'recent-item';
+    btn.title = repoPath;
+    const label = document.createElement('span');
+    label.className = 'recent-path';
+    label.textContent = compact ? shorten(repoPath) : repoPath;
+    const meta = document.createElement('span');
+    meta.className = 'recent-meta';
+    meta.textContent = shortTargetName(repoPath);
+    btn.appendChild(label);
+    btn.appendChild(meta);
+    btn.addEventListener('click', () => {
+      $('#recent-menu')?.classList.add('hidden');
+      openRepo(repoPath);
+    });
+    container.appendChild(btn);
+  }
+}
+
+function renderRecentRepos() {
+  const recents = getRecentRepos();
+  renderRecentList($('#welcome-recents'), recents);
+  renderRecentList($('#recent-menu'), recents, { compact: true });
+  const clear = $('#recent-clear');
+  if (clear) clear.disabled = recents.length === 0;
 }
 
 // ============================================================
@@ -92,37 +172,15 @@ function fileDisplayLabel(f) {
 
 function renderModuleList(filter = '') {
   const list = $('#file-list');
-  list.innerHTML = '';
+  const frag = document.createDocumentFragment();
   const f = filter.toLowerCase();
+  const hasFilter = !!f.trim();
 
   // group files by layer → kind → files
   const grouped = new Map();
   for (const file of graph.files.values()) {
-    if (file.hidden) continue;
-    let aliases = file.kind === 'table'
-      ? ' sql database db table data read write insert update delete'
-      : file.kind === 'schema'
-        ? ' sql database schema migration data'
-        : file.kind === 'model'
-          ? ' database db model entity orm data'
-          : file.kind === 'infra'
-            ? ' docker terraform deploy deployment infra infrastructure vercel netlify compose'
-            : file.kind === 'job'
-              ? ' job worker queue cron background script'
-              : file.kind === 'service'
-                ? ' service server backend api process daemon'
-                : file.kind === 'endpoint'
-          ? ' api endpoint route server http get post put patch delete'
-          : '';
-    if (file.gitStatus && file.gitStatus.dirty) aliases += ' git dirty changed uncommitted modified';
-    if (file.kind === 'table' && file.sqlStats) {
-      if (file.sqlStats.read) aliases += ' reads read';
-      if (file.sqlStats.write) aliases += ' writes write mutation changed';
-      if (file.sqlStats.insert) aliases += ' insert';
-      if (file.sqlStats.update) aliases += ' update';
-      if (file.sqlStats.delete) aliases += ' delete';
-    }
-    const text = `${fileDisplayLabel(file)} ${file.id} ${file.kind}${aliases}`.toLowerCase();
+    if (file.hidden && !hasFilter) continue;
+    const text = file.searchText || `${fileDisplayLabel(file)} ${file.id} ${file.kind}`.toLowerCase();
     if (f && !text.includes(f)) continue;
     const layerId = KIND_TO_LAYER[file.kind] || 'support';
     if (!grouped.has(layerId)) grouped.set(layerId, new Map());
@@ -137,7 +195,7 @@ function renderModuleList(filter = '') {
     const layerHeader = document.createElement('div');
     layerHeader.className = 'sidebar-layer';
     layerHeader.textContent = LAYER_NAMES[layerId];
-    list.appendChild(layerHeader);
+    frag.appendChild(layerHeader);
 
     const byKind = grouped.get(layerId);
     const kinds = [...byKind.keys()].sort();
@@ -146,7 +204,7 @@ function renderModuleList(filter = '') {
       const kindHeader = document.createElement('div');
       kindHeader.className = 'sidebar-kind';
       kindHeader.textContent = `${prettyKind(k)} · ${files.length}`;
-      list.appendChild(kindHeader);
+      frag.appendChild(kindHeader);
       for (const file of files.slice(0, 100)) {
         count++;
         const row = document.createElement('div');
@@ -165,17 +223,31 @@ function renderModuleList(filter = '') {
           selectFile(file.id);
           graph.panTo(file.id);
         });
-        list.appendChild(row);
+        frag.appendChild(row);
       }
       if (files.length > 100) {
         const more = document.createElement('div');
         more.className = 'group-more';
         more.textContent = `… +${files.length - 100} more`;
-        list.appendChild(more);
+        frag.appendChild(more);
       }
     }
   }
+  list.replaceChildren(frag);
   $('#file-count').textContent = String(count);
+}
+
+let fileChromeRefreshTimer = null;
+function refreshFileChrome() {
+  renderKindFilter();
+  renderModuleList($('#filter-input').value);
+}
+function scheduleFileChromeRefresh(delay = 90) {
+  clearTimeout(fileChromeRefreshTimer);
+  fileChromeRefreshTimer = setTimeout(() => {
+    fileChromeRefreshTimer = null;
+    refreshFileChrome();
+  }, delay);
 }
 
 function prettyKind(k) {
@@ -200,7 +272,15 @@ function kindHue(k) {
   }[k]) || 220;
 }
 
-$('#filter-input').addEventListener('input', (e) => renderModuleList(e.target.value));
+let sideFilterDebounce = null;
+$('#filter-input').addEventListener('input', (e) => {
+  const v = e.target.value;
+  clearTimeout(sideFilterDebounce);
+  sideFilterDebounce = setTimeout(() => {
+    graph.setSearch(v);
+    renderModuleList(v);
+  }, 60);
+});
 $('#theme-toggle').addEventListener('click', () => {
   const next = document.body.classList.contains('theme-light') ? 'dark' : 'light';
   applyTheme(next, true);
@@ -498,8 +578,6 @@ function renderFileDetail(f) {
       </div>
     </div>
     <div class="detail-actions">
-      <button class="primary-btn" data-action="explain">Explain</button>
-      <button class="primary-btn alt" data-action="audit">Audit</button>
       <button class="ghost-btn" data-action="open">Open file</button>
     </div>
 
@@ -683,155 +761,16 @@ function renderFileDetail(f) {
 
 function onFileAction(f, action) {
   const targetFile = f.parentFile || f.id;
-  const targetLabel = f.kind === 'table' ? `${f.label} table in \`${targetFile}\`` : `\`${targetFile}\``;
-  if (action === 'explain') {
-    runPrompt(`Explain what ${targetLabel} does in plain English: its responsibilities, its public surface, and how it fits in the overall system. Read it first.`, 'explore');
-    switchTab('chat');
-  } else if (action === 'audit') {
-    runPrompt(`Audit ${targetLabel} — bugs, code smells, performance, security risks. Read related files for context.`, 'explore');
-    switchTab('chat');
-  } else if (action === 'open') {
+  if (action === 'open') {
     loadFileViewer(targetFile);
     switchTab('file');
   }
 }
 
-function onModuleAction() {} // legacy no-op
+function onModuleAction() {}
 
-// ============================================================
-// Swap workflow
-// ============================================================
-function openSwapDialog(m) {
-  const modal = $('#swap-modal');
-  modal.classList.remove('hidden');
-  $('#swap-title').textContent = `Swap "${m.label}"`;
-  $('#swap-current').innerHTML = `<b>${m.files.length} files</b> in <code>${escapeHtml(m.key)}</code>:<br/>` +
-    m.files.slice(0, 12).map(f => `<div>· ${escapeHtml(f.id)}</div>`).join('') +
-    (m.files.length > 12 ? `<div class="dim">… +${m.files.length - 12} more</div>` : '');
-  $('#swap-input').value = '';
-  $('#swap-input').focus();
-  $('#swap-plan-out').textContent = '';
-  $('#swap-apply-btn').disabled = true;
-
-  state.pendingPlan = { moduleKey: m.key, replacement: '', removed: [], added: [], body: '' };
-
-  $('#swap-cancel-btn').onclick = () => closeSwapDialog();
-  $('#swap-plan-btn').onclick = () => planSwap(m);
-  $('#swap-apply-btn').onclick = () => applySwap(m);
-}
-function closeSwapDialog() {
-  $('#swap-modal').classList.add('hidden');
-  state.pendingPlan = null;
-}
-
-async function planSwap(m) {
-  const replacement = $('#swap-input').value.trim();
-  if (!replacement) return;
-  $('#swap-plan-out').textContent = 'Planning…';
-  $('#swap-apply-btn').disabled = true;
-
-  // Highlight the module being replaced
-  graph.expand(m.key);
-  graph.setReplacement(m.files.map(f => f.id), [], `${m.label} → ${replacement} (planning…)`);
-
-  const prompt = `I want to REPLACE the \`${m.label}\` module (top-level directory \`${m.key}\`) with: ${replacement}
-
-Current files in this module:
-${m.files.map(f => `- ${f.id}`).join('\n')}
-
-Read whatever you need to understand the module. Then produce a plan in this exact JSON shape — and ONLY the JSON, wrapped in a fenced code block:
-
-\`\`\`json
-{
-  "summary": "one sentence describing the swap",
-  "remove": ["files/to/delete.ext", ...],
-  "add":    ["new/files/to/create.ext", ...],
-  "modify": ["existing/files/to/touch.ext", ...],
-  "callers_to_update": ["files outside the module that import it"],
-  "risks": ["short list of risks / breaking changes"],
-  "estimated_steps": 5
-}
-\`\`\`
-
-Do NOT modify any files. This is a planning step only.`;
-
-  state.pendingPlan = { moduleKey: m.key, replacement, removed: [], added: [], body: '' };
-  state.swapPlanCollect = '';
-  state.collectingForSwap = true;
-
-  await runPrompt(prompt, 'explore', { silent: true });
-}
-
-function tryParseSwapPlan(text) {
-  // Extract first ```json ... ``` block
-  const m = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (!m) return null;
-  try {
-    return JSON.parse(m[1]);
-  } catch { return null; }
-}
-
-function presentSwapPlan(plan, moduleKey, replacement) {
-  const m = graph.modules.get(moduleKey);
-  if (!m) return;
-  const removeSet = new Set(plan.remove || []);
-  const addSet = new Set(plan.add || []);
-
-  $('#swap-plan-out').innerHTML = `
-    <div><b>${escapeHtml(plan.summary || `${m.label} → ${replacement}`)}</b></div>
-    <div class="plan-cols">
-      <div class="plan-col plan-remove">
-        <div class="plan-col-title">– remove (${(plan.remove || []).length})</div>
-        ${(plan.remove || []).map(p => `<div>${escapeHtml(p)}</div>`).join('') || '<div class="dim">(none)</div>'}
-      </div>
-      <div class="plan-col plan-add">
-        <div class="plan-col-title">+ add (${(plan.add || []).length})</div>
-        ${(plan.add || []).map(p => `<div>${escapeHtml(p)}</div>`).join('') || '<div class="dim">(none)</div>'}
-      </div>
-      <div class="plan-col plan-modify">
-        <div class="plan-col-title">~ modify (${(plan.modify || []).length})</div>
-        ${(plan.modify || []).map(p => `<div>${escapeHtml(p)}</div>`).join('') || '<div class="dim">(none)</div>'}
-      </div>
-    </div>
-    ${(plan.callers_to_update || []).length ? `
-      <div class="plan-callers"><b>Callers to update:</b><br/>${(plan.callers_to_update || []).map(p => `<div>${escapeHtml(p)}</div>`).join('')}</div>
-    ` : ''}
-    ${(plan.risks || []).length ? `
-      <div class="plan-risks"><b>Risks:</b><br/>${(plan.risks || []).map(p => `<div>${escapeHtml(p)}</div>`).join('')}</div>
-    ` : ''}
-  `;
-  $('#swap-apply-btn').disabled = false;
-
-  graph.setReplacement([...removeSet], [...addSet], `${m.label} → ${replacement}`);
-  state.pendingPlan = {
-    moduleKey,
-    replacement,
-    removed: [...removeSet],
-    added: [...addSet],
-    plan,
-  };
-}
-
-async function applySwap(m) {
-  if (!state.pendingPlan || !state.pendingPlan.plan) return;
-  const plan = state.pendingPlan.plan;
-  const replacement = state.pendingPlan.replacement;
-
-  closeSwapDialog();
-  switchTab('chat');
-
-  const prompt = `Apply the previously-described swap of the \`${m.label}\` module to: ${replacement}.
-
-Plan:
-- remove: ${(plan.remove || []).join(', ') || '(none)'}
-- add:    ${(plan.add || []).join(', ') || '(none)'}
-- modify: ${(plan.modify || []).join(', ') || '(none)'}
-- callers_to_update: ${(plan.callers_to_update || []).join(', ') || '(none)'}
-
-Now execute: create the new files, edit the modify+caller files, and delete the removed files. Read first when needed. Be surgical and explain each step briefly as you go.`;
-
-  await runPrompt(prompt, 'edit');
-}
+// (AI swap workflow removed — agents are real PTYs now; if you want to
+// refactor, type a prompt into the active terminal tile.)
 
 // ============================================================
 // Context menu
@@ -846,17 +785,15 @@ function showContextMenu(hit, x, y) {
     const id = hit.id;
     items = [
       { type: 'header', label: id },
-      { label: 'Explain this file', action: () => runPrompt(`Explain what \`${id}\` does, its responsibilities, and key entry points. Read it first.`, 'explore') },
-      { label: 'Find bugs / smells', action: () => runPrompt(`Audit \`${id}\` for bugs, code smells, and risky patterns. Read related files for context.`, 'explore') },
-      { label: 'Suggest a refactor', action: () => runPrompt(`Read \`${id}\` and propose a concrete refactor with reasoning. Don't apply changes.`, 'explore') },
-      { type: 'divider' },
       { label: 'Open in viewer', action: () => { switchTab('file'); loadFileViewer(id); } },
+      { label: 'Reveal in sidebar',
+        action: () => { selectFile(id); graph.panTo(id); } },
+      { type: 'divider' },
+      { label: 'Copy path', action: () => navigator.clipboard?.writeText(id).catch(() => {}) },
     ];
   } else if (hit.kind === 'ai') {
     items = [
-      { type: 'header', label: 'AI controls' },
-      { label: 'Map this entire repo', action: () => runPrompt(`Give me a high-level architectural map of this repo — entry points, main subsystems, and how data flows. Read enough files to be accurate.`, 'explore') },
-      { label: 'Recent changes', action: () => runPrompt(`Run \`git log --oneline -20\` and explain what's been happening recently.`, 'explore') },
+      { type: 'header', label: 'overlay' },
       { label: 'Clear replacement overlay', action: () => { graph.setReplacement([], [], ''); } },
     ];
   }
@@ -896,17 +833,71 @@ document.addEventListener('click', (e) => {
 // ============================================================
 // Tabs + file viewer
 // ============================================================
+function refitAgents({ focus = false } = {}) {
+  if (!state.agents) return;
+  requestAnimationFrame(() => {
+    let shouldFocus = focus;
+    for (const a of state.agents.values()) {
+      if (a.fitAddon) try { a.fitAddon.fit(); } catch {}
+      if (shouldFocus && a.term) {
+        try { a.term.focus(); } catch {}
+        shouldFocus = false;
+      }
+    }
+  });
+}
+
 function switchTab(name) {
   $$('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
   $$('.tab-pane').forEach(p => p.classList.toggle('active', p.dataset.pane === name));
+  if (name === 'chat' && state.agents) {
+    refitAgents({ focus: true });
+  }
 }
 $$('.tab').forEach(t => t.addEventListener('click', () => switchTab(t.dataset.tab)));
+
+function setWorkspaceView(view, persist = true) {
+  const next = view === 'graph' ? 'graph' : 'agents';
+  state.view = next;
+  document.body.classList.toggle('view-agents', next === 'agents');
+  document.body.classList.toggle('view-graph', next === 'graph');
+  $('#agents-view-btn')?.classList.toggle('active', next === 'agents');
+  $('#graph-view-btn')?.classList.toggle('active', next === 'graph');
+  if (persist) localStorage.setItem(VIEW_STORAGE_KEY, next);
+
+  if (next === 'agents') {
+    graph.setPaused(true);
+    switchTab('chat');
+    refitAgents({ focus: true });
+    return;
+  }
+
+  graph.setPaused(false);
+  if ($('.tab-pane[data-pane="chat"]')?.classList.contains('active')) {
+    switchTab('module');
+  }
+  requestAnimationFrame(() => {
+    graph.refreshSize({ fit: !state.selected });
+    if (state.graphStale && state.root) scheduleRescan(0);
+  });
+}
+
+$('#agents-view-btn')?.addEventListener('click', () => setWorkspaceView('agents'));
+$('#graph-view-btn')?.addEventListener('click', () => setWorkspaceView('graph'));
 
 async function loadFileViewer(rel) {
   const v = $('#file-viewer');
   v.textContent = 'Loading…';
   const res = await window.tree.readFile(rel);
   v.textContent = res.error ? ('Error: ' + res.error) : (res.content || '(empty)');
+}
+
+async function syncFreshAgentsToRepo() {
+  if (!state.root || !state.agents) return;
+  for (const agent of state.agents.values()) {
+    if (agent.provider !== 'shell' || agent.hasInput) continue;
+    await respawnAgent(agent);
+  }
 }
 
 // ============================================================
@@ -920,6 +911,9 @@ async function openRepo(forcePath) {
   $('#repo-name').textContent = shorten(p);
   $('#hud-status').textContent = 'Scanning…';
   $('#welcome').classList.add('hidden');
+  if (window.tree.watchFs) {
+    try { await window.tree.watchFs(p); } catch {}
+  }
 
   const result = await window.tree.scanRepo(p);
   if (result.error) {
@@ -928,10 +922,13 @@ async function openRepo(forcePath) {
   }
   state.graphData = result;
   state.files = result.nodes.filter(n => n.type !== 'external');
+  state.graphStale = false;
+  addRecentRepo(p);
   graph.load(result);
   renderKindFilter();
   renderModuleList();
   renderFileDetail(null);
+  syncFreshAgentsToRepo().catch(() => {});
   const stampEl = $('#stamp-sub');
   if (stampEl) stampEl.textContent = shorten(p);
   const mappedNodes = [...graph.files.values()].filter(f => f.kind !== 'external');
@@ -940,7 +937,6 @@ async function openRepo(forcePath) {
   const stackText = result.stackSummary && result.stackSummary.length ? ` · ${result.stackSummary.slice(0, 5).join('/')}` : '';
   $('#hud-status').textContent = `${result.fileCount} files · ${mappedNodes.length} nodes · ${graph.layers.length} layers · ${dirtyCount} dirty · ${sqlWriteCount} SQL writes${stackText}`;
 
-  pushChat('system', `Loaded blueprint: ${result.fileCount} files across ${graph.layers.length} layers (${[...graph.layers].map(L => L.name).join(', ')}).`);
 }
 
 function shorten(p) {
@@ -952,7 +948,23 @@ function shorten(p) {
 
 $('#open-folder-btn').addEventListener('click', () => openRepo());
 $('#welcome-open').addEventListener('click', () => openRepo());
+$('#recent-toggle')?.addEventListener('click', (e) => {
+  e.stopPropagation();
+  renderRecentRepos();
+  $('#recent-menu')?.classList.toggle('hidden');
+});
+$('#recent-clear')?.addEventListener('click', clearRecentRepos);
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('#recent-menu') && !e.target.closest('#recent-toggle')) {
+    $('#recent-menu')?.classList.add('hidden');
+  }
+});
 window.tree.onMenuOpenFolder(() => openRepo());
+if (window.tree.onOpenRoot) {
+  window.tree.onOpenRoot((evt) => {
+    if (evt && evt.root) openRepo(evt.root);
+  });
+}
 
 window.tree.onScanProgress((evt) => {
   if (evt.status === 'scanning') $('#hud-status').textContent = 'Scanning ' + shorten(evt.root) + '…';
@@ -960,22 +972,48 @@ window.tree.onScanProgress((evt) => {
   else if (evt.status === 'done') $('#hud-status').textContent = `Mapped ${evt.count} files in ${evt.ms}ms`;
 });
 
+renderRecentRepos();
+(async () => {
+  try {
+    const root = window.tree.getStartupRoot ? await window.tree.getStartupRoot() : null;
+    if (root) await openRepo(root);
+  } catch {}
+})();
+
 // ============================================================
-// Multi-agent chat
+// Multi-agent terminals
 //
-// Each agent is its own Claude session with its own message list, mode,
-// model, and running state. Agents arrange in a grid in the chat tab.
-// `runPrompt(prompt, mode, opts)` routes to the "primary" agent (first one
-// created), so existing callers (context menus, swap workflow, file detail
-// actions) keep working unchanged.
+// Each agent is an xterm.js tile backed by a PTY. The focused tile becomes the
+// attribution source for filesystem edits that show up as colored graph rings.
 // ============================================================
-state.agents = new Map();          // id → agent record
-state.primaryAgentId = null;
 let agentCounter = 0;
 
 function newAgentId() { return 'a' + (++agentCounter); }
 
-function createAgent({ label, primary = false, mode = 'explore', model = '' } = {}) {
+function setActiveAgent(agentId) {
+  if (!agentId || !state.agents.has(agentId)) return;
+  state.activeAgentId = agentId;
+  for (const a of state.agents.values()) {
+    a.dom?.tile?.classList.toggle('active', a.id === agentId);
+  }
+}
+
+function fileWriteSourceMeta() {
+  const agent = state.agents.get(state.activeAgentId) || state.agents.get(state.primaryAgentId);
+  if (!agent) return EXTERNAL_WRITE_META;
+  const now = Date.now();
+  const recentAgentActivity = Math.max(agent.lastInputAt || 0, agent.lastOutputAt || 0);
+  if (recentAgentActivity && now - recentAgentActivity <= AGENT_WRITE_WINDOW_MS) {
+    return { agentId: agent.id, label: agent.label, color: agent.color };
+  }
+  return EXTERNAL_WRITE_META;
+}
+
+// Each agent tile is an embedded xterm.js terminal connected to a node-pty
+// process. Provider picker chooses shell / codex / claude. There's also a
+// "↗" button that re-launches the same command in your real Terminal.app
+// as a fallback for TUIs that don't render correctly inside xterm.
+function createAgent({ label, primary = false, provider = 'shell' } = {}) {
   const id = newAgentId();
   const grid = $('#agents-grid');
   if (!grid) return null;
@@ -983,7 +1021,7 @@ function createAgent({ label, primary = false, mode = 'explore', model = '' } = 
   const tile = document.createElement('div');
   tile.className = 'agent-tile';
   tile.dataset.agentId = id;
-  tile.dataset.mode = mode;
+  tile.dataset.provider = provider;
   tile.style.setProperty('--agent-color', color);
   const lbl = label || `Agent ${state.agents.size + 1}`;
   tile.innerHTML = `
@@ -991,184 +1029,185 @@ function createAgent({ label, primary = false, mode = 'explore', model = '' } = 
       <span class="agent-dot"></span>
       <div class="agent-title-stack">
         <span class="agent-name">${escapeHtml(lbl)}</span>
-        <span class="agent-activity">idle</span>
+        <span class="agent-activity">starting…</span>
       </div>
-      <span class="agent-mode" data-mode="${mode}">${mode === 'edit' ? 'EDIT' : 'EXPLORE'}</span>
-      <select class="agent-model" title="Model">
-        <option value="">Default</option>
-        <option value="claude-opus-4-7">Opus 4.7</option>
-        <option value="claude-sonnet-4-6">Sonnet 4.6</option>
-        <option value="claude-haiku-4-5">Haiku 4.5</option>
+      <select class="agent-provider" title="Provider">
+        <option value="shell">SHELL</option>
+        <option value="claude">CLAUDE</option>
+        <option value="codex">CODEX</option>
       </select>
-      <button class="agent-stop hidden" title="Stop">STOP</button>
-      <button class="agent-close" title="Close agent" ${primary ? 'style="display:none"' : ''}>x</button>
+      <button class="agent-restart" title="Restart">⟲</button>
+      <button class="agent-external" title="Open in external Terminal.app">↗</button>
+      <button class="agent-close" title="Close" ${primary ? 'style="display:none"' : ''}>×</button>
     </div>
-    <div class="agent-messages"></div>
-    <div class="agent-input">
-      <textarea rows="2" placeholder="Ask Claude..."></textarea>
-      <div class="agent-input-row">
-        <button class="ghost-btn agent-send">SEND</button>
-      </div>
-    </div>
+    <div class="agent-term"></div>
   `;
   grid.appendChild(tile);
 
   const dom = {
     tile,
-    head: tile.querySelector('.agent-head'),
     dot: tile.querySelector('.agent-dot'),
     name: tile.querySelector('.agent-name'),
     activity: tile.querySelector('.agent-activity'),
-    modeBadge: tile.querySelector('.agent-mode'),
-    modelSelect: tile.querySelector('.agent-model'),
-    stopBtn: tile.querySelector('.agent-stop'),
+    providerSelect: tile.querySelector('.agent-provider'),
+    restartBtn: tile.querySelector('.agent-restart'),
+    externalBtn: tile.querySelector('.agent-external'),
     closeBtn: tile.querySelector('.agent-close'),
-    messages: tile.querySelector('.agent-messages'),
-    input: tile.querySelector('textarea'),
-    sendBtn: tile.querySelector('.agent-send'),
+    termHost: tile.querySelector('.agent-term'),
   };
-  dom.modelSelect.value = model || '';
-  dom.modeBadge.classList.toggle('edit', mode === 'edit');
+  dom.providerSelect.value = provider;
 
   const agent = {
-    id, label: lbl, primary,
-    color,
-    mode, model: model || '',
-    running: false,
-    reads: new Set(),
-    edits: new Set(),
-    lastTarget: null,
-    assistantBubble: null,
-    thinkingBubble: null,
+    id, label: lbl, primary, color, provider,
+    term: null, fitAddon: null, _ro: null,
+    hasInput: false,
+    lastInputAt: 0,
+    lastOutputAt: 0,
     dom,
   };
   state.agents.set(id, agent);
   if (primary) state.primaryAgentId = id;
+  if (!state.activeAgentId) setActiveAgent(id);
 
-  // Toggle mode on click
-  dom.modeBadge.addEventListener('click', () => {
-    agent.mode = agent.mode === 'edit' ? 'explore' : 'edit';
-    dom.modeBadge.textContent = agent.mode === 'edit' ? 'EDIT' : 'EXPLORE';
-    dom.modeBadge.classList.toggle('edit', agent.mode === 'edit');
-    tile.dataset.mode = agent.mode;
-    if (!agent.running) dom.activity.textContent = agent.mode === 'edit' ? 'edit mode' : 'explore mode';
+  bootAgentTerminal(agent);
+
+  dom.providerSelect.addEventListener('change', async () => {
+    const np = dom.providerSelect.value;
+    if (np === agent.provider) return;
+    agent.provider = np;
+    tile.dataset.provider = np;
+    await respawnAgent(agent);
   });
-  dom.modelSelect.addEventListener('change', () => { agent.model = dom.modelSelect.value || ''; });
-  dom.stopBtn.addEventListener('click', async () => {
-    await window.tree.cancelClaude(id);
+  dom.restartBtn.addEventListener('click', () => respawnAgent(agent));
+  dom.externalBtn.addEventListener('click', async () => {
+    const r = await window.tree.launchAgent({ provider: agent.provider, cwd: state.root || undefined });
+    if (r && r.error) agent.dom.activity.textContent = r.error;
+    else if (r && r.app) agent.dom.activity.textContent = `also running in ${r.app}`;
   });
   dom.closeBtn.addEventListener('click', async () => {
-    if (agent.running) await window.tree.cancelClaude(id);
+    try { await window.tree.ptyKill(id); } catch {}
+    if (agent._ro) try { agent._ro.disconnect(); } catch {}
+    if (agent.term) try { agent.term.dispose(); } catch {}
     state.agents.delete(id);
     tile.remove();
-    relayoutAgentGrid();
-  });
-  dom.sendBtn.addEventListener('click', () => sendAgentInput(id));
-  dom.input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-      e.preventDefault();
-      sendAgentInput(id);
+    if (state.activeAgentId === id) {
+      state.activeAgentId = null;
+      const nextId = state.agents.keys().next().value;
+      if (nextId) setActiveAgent(nextId);
     }
+    relayoutAgentGrid();
   });
 
   relayoutAgentGrid();
   return agent;
 }
 
+const XTERM_THEME = {
+  background: '#000000',
+  foreground: '#e7ded1',
+  cursor: '#e7ded1',
+  cursorAccent: '#000000',
+  selectionBackground: 'rgba(231, 222, 209, 0.25)',
+  black: '#1c1a17', red: '#c98a8a', green: '#9ab18d',
+  yellow: '#c8b072', blue: '#8aa7c4', magenta: '#b89bb4',
+  cyan: '#9bb8b6', white: '#e7ded1',
+  brightBlack: '#5a5852', brightRed: '#dba5a5', brightGreen: '#b5cba8',
+  brightYellow: '#dfc88c', brightBlue: '#a3c2dd', brightMagenta: '#cfb6cc',
+  brightCyan: '#b6d2d0', brightWhite: '#f3ece0',
+};
+
+async function bootAgentTerminal(agent) {
+  if (!window.Terminal) { agent.dom.activity.textContent = 'xterm failed to load'; return; }
+  agent.dom.activity.textContent = 'starting…';
+
+  const term = new window.Terminal({
+    theme: XTERM_THEME,
+    fontFamily: '"NB Akademie Mono", "Space Mono", ui-monospace, SFMono-Regular, Menlo, monospace',
+    fontSize: 12,
+    lineHeight: 1.2,
+    convertEol: true,
+    cursorBlink: true,
+    scrollback: 5000,
+    allowProposedApi: true,
+  });
+  const fitCtor = window.FitAddon && window.FitAddon.FitAddon;
+  const fit = fitCtor ? new fitCtor() : null;
+  if (fit) term.loadAddon(fit);
+  term.open(agent.dom.termHost);
+  agent.term = term;
+  agent.fitAddon = fit;
+
+  agent.dom.termHost.addEventListener('click', () => {
+    setActiveAgent(agent.id);
+    try { term.focus(); } catch {}
+  });
+  if (term.onFocus) term.onFocus(() => setActiveAgent(agent.id));
+  if (window.ResizeObserver) {
+    const ro = new ResizeObserver(() => {
+      if (!agent.dom.tile.isConnected) return;
+      if (fit) try { fit.fit(); } catch {}
+    });
+    ro.observe(agent.dom.termHost);
+    agent._ro = ro;
+  }
+
+  await new Promise((r) => requestAnimationFrame(() => r()));
+  if (fit) try { fit.fit(); } catch {}
+
+  term.onData((data) => {
+    if (data) {
+      agent.hasInput = true;
+      agent.lastInputAt = Date.now();
+    }
+    window.tree.ptyWrite(agent.id, data);
+  });
+  term.onResize(({ cols, rows }) => window.tree.ptyResize(agent.id, cols, rows));
+
+  agent.dom.dot.classList.add('running');
+
+  const dims = (fit && fit.proposeDimensions()) || { cols: 100, rows: 32 };
+  const r = await window.tree.ptySpawn({
+    agentId: agent.id,
+    provider: agent.provider,
+    cwd: state.root || undefined,
+    cols: Math.max(20, dims.cols || 100),
+    rows: Math.max(8,  dims.rows || 32),
+  });
+  if (r && r.error) {
+    term.writeln(`\x1b[31m${r.error}\x1b[0m`);
+    agent.dom.activity.textContent = 'failed';
+    agent.dom.dot.classList.remove('running');
+    return;
+  }
+  agent.dom.activity.textContent = `${agent.provider} · pid ${r.pid || ''}`;
+  try { term.focus(); } catch {}
+}
+
+async function respawnAgent(agent) {
+  try { await window.tree.ptyKill(agent.id); } catch {}
+  if (agent.term) { try { agent.term.dispose(); } catch {} agent.term = null; }
+  if (agent._ro) { try { agent._ro.disconnect(); } catch {} agent._ro = null; }
+  agent.hasInput = false;
+  agent.lastInputAt = 0;
+  agent.lastOutputAt = 0;
+  agent.dom.termHost.innerHTML = '';
+  await bootAgentTerminal(agent);
+}
+
 function relayoutAgentGrid() {
   const grid = $('#agents-grid');
   if (!grid) return;
-  const count = state.agents.size;
-  grid.dataset.count = String(count);
+  grid.dataset.count = String(state.agents.size);
   const cEl = $('#agents-count');
-  if (cEl) cEl.textContent = String(count);
+  if (cEl) cEl.textContent = String(state.agents.size);
 }
 
-async function sendAgentInput(agentId) {
-  const agent = state.agents.get(agentId);
-  if (!agent) return;
-  const text = agent.dom.input.value.trim();
-  if (!text) return;
-  agent.dom.input.value = '';
-  await runOnAgent(agentId, text, { mode: agent.mode, model: agent.model });
-}
-
-function pushAgentChat(agentId, role, text) {
-  const agent = state.agents.get(agentId);
-  if (!agent) return null;
-  const wrap = agent.dom.messages;
-  const el = document.createElement('div');
-  el.className = 'msg ' + role;
-  el.textContent = text;
-  wrap.appendChild(el);
-  wrap.scrollTop = wrap.scrollHeight;
-  return el;
-}
-function pushAgentTool(agentId, toolName, target) {
-  const agent = state.agents.get(agentId);
-  if (!agent) return;
-  const wrap = agent.dom.messages;
-  const el = document.createElement('div');
-  el.className = 'msg tool';
-  el.style.borderLeftColor = agent.color;
-  el.innerHTML = `<span class="tool-name">${escapeHtml(toolName)}</span> ${escapeHtml(target || '')}`;
-  wrap.appendChild(el);
-  wrap.scrollTop = wrap.scrollHeight;
-}
-function autoScrollAgent(agentId) {
-  const agent = state.agents.get(agentId);
-  if (!agent) return;
-  const wrap = agent.dom.messages;
-  const nearBottom = wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 80;
-  if (nearBottom) wrap.scrollTop = wrap.scrollHeight;
-}
-function setAgentRunning(agentId, running) {
-  const agent = state.agents.get(agentId);
-  if (!agent) return;
-  agent.running = running;
-  agent.dom.tile.classList.toggle('running', running);
-  agent.dom.dot.classList.toggle('running', running);
-  agent.dom.sendBtn.classList.toggle('hidden', running);
-  agent.dom.stopBtn.classList.toggle('hidden', !running);
-  if (agent.dom.activity && running) {
-    agent.dom.activity.textContent = agent.mode === 'edit' ? 'editing...' : 'thinking...';
-  } else if (agent.dom.activity) {
-    agent.dom.activity.textContent = agent.lastTarget
-      ? `last ${shortTargetName(agent.lastTarget)}`
-      : (agent.mode === 'edit' ? 'edit mode' : 'explore mode');
+// Refit terminals when the tab/window shows them.
+window.addEventListener('resize', () => {
+  for (const a of state.agents.values()) {
+    if (a.fitAddon) try { a.fitAddon.fit(); } catch {}
   }
-}
-
-function markAgentTarget(agent, target, kind) {
-  if (!agent || !target) return;
-  agent.lastTarget = target;
-  if (kind === 'edit') agent.edits.add(target);
-  else agent.reads.add(target);
-  if (agent.dom.activity) {
-    agent.dom.activity.textContent = `${kind === 'edit' ? 'editing' : 'reading'} ${shortTargetName(target)}`;
-  }
-  graph.touch(target, kind, {
-    agentId: agent.id,
-    label: agent.label,
-    color: agent.color,
-  });
-}
-
-// Legacy helpers used by other parts of app.js (file detail and swap workflow).
-// These route to the primary agent.
-function pushChat(role, text) {
-  const id = state.primaryAgentId;
-  if (!id) return null;
-  return pushAgentChat(id, role, text);
-}
-function pushTool(toolName, target) {
-  const id = state.primaryAgentId;
-  if (!id) return;
-  return pushAgentTool(id, toolName, target);
-}
-function autoScrollChat() {
-  if (state.primaryAgentId) autoScrollAgent(state.primaryAgentId);
-}
+});
 function pushLog(kind, text) {
   const list = $('#log-list');
   const el = document.createElement('div');
@@ -1257,59 +1296,9 @@ function labelForKind(k) {
   return map[k] || (k ? k[0].toUpperCase() + k.slice(1) : 'Other');
 }
 
-function selectedModel() {
-  const a = state.agents.get(state.primaryAgentId);
-  return a ? (a.model || null) : null;
-}
-
-// Send a prompt to a specific agent.
-async function runOnAgent(agentId, prompt, opts = {}) {
-  const agent = state.agents.get(agentId);
-  if (!agent) return;
-  if (agent.running) {
-    pushAgentChat(agentId, 'error', 'This agent is busy — stop it first or use another agent.');
-    return;
-  }
-  if (!state.root) {
-    pushAgentChat(agentId, 'error', 'Open a repo first.');
-    return;
-  }
-  if (!opts.silent) {
-    pushAgentChat(agentId, 'user', prompt.length > 280 ? prompt.slice(0, 280) + '…' : prompt);
-  }
-  setAgentRunning(agentId, true);
-  agent.assistantBubble = null;
-  agent.thinkingBubble = null;
-  const focus = state.selected && state.selected.kind === 'file' ? state.selected.id : null;
-  let r;
-  try {
-    r = await window.tree.runClaude({
-      agentId,
-      prompt,
-      mode: opts.mode || agent.mode,
-      focusNode: focus,
-      model: opts.model || agent.model || undefined,
-    });
-  } catch (err) {
-    pushAgentChat(agentId, 'error', err && err.message ? err.message : String(err));
-    setAgentRunning(agentId, false);
-    return;
-  }
-  if (r && r.error) {
-    pushAgentChat(agentId, 'error', r.error);
-    setAgentRunning(agentId, false);
-  }
-}
-
-// Legacy entry point: route to the primary agent.
-async function runPrompt(prompt, mode = 'explore', opts = {}) {
-  ensurePrimaryAgent();
-  return runOnAgent(state.primaryAgentId, prompt, { ...opts, mode });
-}
-
 function ensurePrimaryAgent() {
   if (state.primaryAgentId && state.agents.has(state.primaryAgentId)) return;
-  const a = createAgent({ label: 'Primary', primary: true });
+  const a = createAgent({ label: 'Primary', primary: true, provider: 'shell' });
   if (!a) return;
   state.primaryAgentId = a.id;
 }
@@ -1318,9 +1307,91 @@ ensurePrimaryAgent();
 const newAgentBtn = $('#new-agent-btn');
 if (newAgentBtn) {
   newAgentBtn.addEventListener('click', () => {
-    createAgent({ label: `Agent ${state.agents.size + 1}` });
+    createAgent({ label: `Agent ${state.agents.size + 1}`, provider: 'shell' });
   });
 }
+setWorkspaceView(localStorage.getItem(VIEW_STORAGE_KEY) || 'agents', false);
+
+// ===== PTY data → write to the right xterm =====
+window.tree.onPtyData(({ agentId, data }) => {
+  const agent = state.agents.get(agentId);
+  if (!agent || !agent.term) return;
+  if (data) agent.lastOutputAt = Date.now();
+  agent.term.write(data);
+});
+window.tree.onPtyExit(({ agentId, exitCode, signal }) => {
+  const agent = state.agents.get(agentId);
+  if (!agent) return;
+  agent.dom.dot.classList.remove('running');
+  agent.dom.activity.textContent = `exited ${exitCode != null ? `(${exitCode})` : signal ? `[${signal}]` : ''}`;
+  if (agent.term) agent.term.writeln(`\r\n\x1b[2m[exited]\x1b[0m`);
+});
+
+// ===== Filesystem watcher → graph + ledger =====
+// File create/delete events trigger a debounced full re-scan (cheap — ~350ms
+// on real repos) so node metadata is accurate. We also do an immediate
+// stub-insert / stub-remove so the change is visible right away.
+let rescanTimer = null;
+let rescanSeq = 0;
+function scheduleRescan(delay = 600) {
+  state.graphStale = true;
+  clearTimeout(rescanTimer);
+  const seq = ++rescanSeq;
+  rescanTimer = setTimeout(async () => {
+    rescanTimer = null;
+    if (!state.root) return;
+    const result = await window.tree.scanRepo(state.root);
+    if (seq !== rescanSeq) return;
+    if (result && !result.error) {
+      state.graphData = result;
+      state.files = result.nodes.filter(n => n.type !== 'external');
+      graph.load(result);
+      refreshFileChrome();
+      state.graphStale = false;
+    }
+  }, delay);
+}
+
+function stubHintForPath(rel) {
+  const name = rel.split('/').pop() || rel;
+  const ext = name.includes('.') ? '.' + name.split('.').pop().toLowerCase() : '';
+  let kind = 'module';
+  if (/\.(css|scss|sass|less)$/i.test(name)) kind = 'styles';
+  else if (/\.(test|spec)\.(t|j)sx?$/i.test(name) || /^test_.+\.py$/i.test(name)) kind = 'test';
+  else if (/\.sql$/i.test(name) || /schema\.(ts|js|prisma|sql)$/i.test(name)) kind = 'schema';
+  else if (/^(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|Cargo\.lock|poetry\.lock)$/i.test(name)) kind = 'config';
+  else if (/dockerfile|docker-compose\.ya?ml|compose\.ya?ml/i.test(name) || /\.tf$/i.test(name)) kind = 'infra';
+  return { label: name, kind, ext };
+}
+
+window.tree.onFsEvent((evt) => {
+  if (evt.type === 'error') return;
+  const rel = evt.path;
+  if (!rel) return;
+  const opMap = { add: 'CREATE', change: 'EDIT', unlink: 'DELETE' };
+  const agentMeta = fileWriteSourceMeta();
+  state.graphStale = true;
+  if (evt.type === 'unlink') {
+    // Drop the node + its edges immediately so the graph stays accurate.
+    graph.removeFile(rel);
+  } else if (evt.type === 'add' && !graph.files.get(rel)) {
+    // Show the new file straight away; full metadata comes in on rescan.
+    graph.addFileStub(rel, stubHintForPath(rel));
+    graph.touch(rel, 'edit', agentMeta);
+  } else if (graph.files.get(rel)) {
+    graph.touch(rel, 'edit', agentMeta);
+  }
+  if (evt.type === 'add' || evt.type === 'unlink') scheduleRescan(160);
+  else if (evt.type === 'change') scheduleRescan(900);
+  scheduleFileChromeRefresh(90);
+  pushLog(agentMeta.agentId === '__external__' ? 'result' : 'tool', `${agentMeta.label} ${opMap[evt.type] || evt.type.toUpperCase()} ${rel}`);
+  pushLedger({
+    op: opMap[evt.type] || evt.type.toUpperCase(),
+    target: rel,
+    status: agentMeta.label,
+    fileId: graph.files.get(rel) ? rel : null,
+  });
+});
 
 // ===== Resize handles for sidebars =====
 {
@@ -1362,102 +1433,6 @@ if (newAgentBtn) {
   }
 }
 
-window.tree.onClaudeEvent((evt) => {
-  const aId = evt.agentId;
-  const agent = aId ? state.agents.get(aId) : null;
-
-  if (evt.type === 'start') {
-    pushLog('tool', `> ${agent ? agent.label : 'Agent'} started`);
-    pushLedger({ op: 'PROMPT', target: (evt.prompt || '').slice(0, 80), status: '…' });
-    return;
-  }
-  if (evt.type === 'system' && evt.subtype === 'init') {
-    const m = evt.data?.model || 'claude';
-    const sid = evt.data?.session_id ? ` · ${String(evt.data.session_id).slice(0, 8)}` : '';
-    if (agent) pushAgentChat(aId, 'system', `Session${sid} · ${m}`);
-    return;
-  }
-  if (evt.type === 'thinking') {
-    if (!agent) return;
-    if (!agent.thinkingBubble) agent.thinkingBubble = pushAgentChat(aId, 'thinking', '');
-    agent.thinkingBubble.textContent += evt.text;
-    autoScrollAgent(aId);
-    return;
-  }
-  if (evt.type === 'text') {
-    if (!agent) return;
-    agent.thinkingBubble = null;
-    if (!agent.assistantBubble) agent.assistantBubble = pushAgentChat(aId, 'assistant', '');
-    agent.assistantBubble.textContent += evt.text;
-    // Swap workflow collects from the primary agent's stream
-    if (state.collectingForSwap && aId === state.primaryAgentId) {
-      state.swapPlanCollect = (state.swapPlanCollect || '') + evt.text;
-    }
-    autoScrollAgent(aId);
-    return;
-  }
-  if (evt.type === 'tool_use') {
-    if (agent) {
-      agent.assistantBubble = null;
-      agent.thinkingBubble = null;
-    }
-    const target = evt.target || (evt.input && (evt.input.file_path || evt.input.path));
-    if (agent) pushAgentTool(aId, evt.tool, target);
-    pushLog('tool', `${evt.tool} ${target || ''}`);
-    const opMap = { Read: 'READ', Edit: 'EDIT', Write: 'EDIT', NotebookEdit: 'EDIT', Bash: 'BASH', Grep: 'GREP', Glob: 'GLOB' };
-    const op = opMap[evt.tool] || evt.tool.toUpperCase();
-    pushLedger({ op, target: target || '', status: '…', fileId: target && graph.files.get(target) ? target : null });
-    if (target) {
-      const isEdit = ['Edit', 'Write', 'NotebookEdit'].includes(evt.tool);
-      if (agent && graph.files.get(target)) markAgentTarget(agent, target, isEdit ? 'edit' : 'read');
-      else graph.touch(target, isEdit ? 'edit' : 'read');
-    }
-    return;
-  }
-  if (evt.type === 'tool_result') {
-    pushLog('result', evt.ok ? 'ok' : 'error');
-    const list = $('#ledger-entries');
-    if (list && list.firstChild) {
-      const status = list.firstChild.querySelector('.col-status');
-      if (status) status.textContent = evt.ok ? 'OK' : 'ERR';
-      if (!evt.ok) list.firstChild.classList.add('status-error');
-    }
-    return;
-  }
-  if (evt.type === 'result') {
-    if (agent) setAgentRunning(aId, false);
-    const cost = evt.cost != null ? `$${Number(evt.cost).toFixed(4)}` : '';
-    const dur = evt.duration != null ? `${(evt.duration / 1000).toFixed(1)}s` : '';
-    $('#hud-cost').textContent = [cost, dur, `${evt.turns || 0} turns`].filter(Boolean).join(' · ');
-    pushLog('result', `done ${cost} ${dur}`);
-    pushLedger({ op: 'DONE', target: `${evt.turns || 0} turns`, status: dur || 'OK' });
-
-    if (state.collectingForSwap && aId === state.primaryAgentId) {
-      state.collectingForSwap = false;
-      const text = state.swapPlanCollect || '';
-      const plan = tryParseSwapPlan(text);
-      if (plan && state.pendingPlan) {
-        presentSwapPlan(plan, state.pendingPlan.moduleKey, state.pendingPlan.replacement);
-      } else if (state.pendingPlan) {
-        $('#swap-plan-out').textContent = 'Could not parse a plan. See chat for raw output.';
-      }
-    }
-    return;
-  }
-  if (evt.type === 'error') {
-    if (agent) {
-      setAgentRunning(aId, false);
-      pushAgentChat(aId, 'error', evt.error);
-    }
-    pushLog('error', evt.error);
-    pushLedger({ op: 'ERROR', target: (evt.error || '').slice(0, 80), status: 'ERR' });
-    state.collectingForSwap = false;
-    return;
-  }
-  if (evt.type === 'canceled' || evt.type === 'done') {
-    if (agent) setAgentRunning(aId, false);
-  }
-});
 
 // ============================================================
 // Visibility filter (kind pills)
@@ -1479,7 +1454,7 @@ const FILTER_ORDER = [
 function renderKindFilter() {
   const wrap = $('#kind-filter');
   if (!wrap) return;
-  wrap.innerHTML = '';
+  const frag = document.createDocumentFragment();
   // Count files per kind from the loaded graph
   const counts = new Map();
   for (const f of graph.files.values()) counts.set(f.kind, (counts.get(f.kind) || 0) + 1);
@@ -1494,7 +1469,7 @@ function renderKindFilter() {
       renderKindFilter();
       renderModuleList($('#filter-input').value);
     });
-    wrap.appendChild(pill);
+    frag.appendChild(pill);
   }
   const signals = [
     { key: 'dirty', label: 'Dirty', count: [...graph.files.values()].filter(f => f.gitStatus && f.gitStatus.dirty).length },
@@ -1516,8 +1491,9 @@ function renderKindFilter() {
         renderModuleList(s.key);
       }
     });
-    wrap.appendChild(pill);
+    frag.appendChild(pill);
   }
+  wrap.replaceChildren(frag);
 }
 
 // ============================================================
@@ -1530,12 +1506,16 @@ searchInput.addEventListener('input', (e) => {
   const v = e.target.value;
   searchClear.classList.toggle('hidden', !v);
   clearTimeout(searchDebounce);
-  searchDebounce = setTimeout(() => graph.setSearch(v), 60);
+  searchDebounce = setTimeout(() => {
+    graph.setSearch(v);
+    renderModuleList(v);
+  }, 60);
 });
 searchClear.addEventListener('click', () => {
   searchInput.value = '';
   searchClear.classList.add('hidden');
   graph.setSearch('');
+  renderModuleList($('#filter-input').value);
   searchInput.focus();
 });
 // Cmd/Ctrl+F focuses search
@@ -1549,18 +1529,22 @@ document.addEventListener('keydown', (e) => {
     searchInput.value = '';
     searchClear.classList.add('hidden');
     graph.setSearch('');
+    renderModuleList($('#filter-input').value);
     searchInput.blur();
   }
 });
 
 // ============================================================
-// Initial check — real preflight against the claude CLI
+// Provider preflight — surface which CLIs are available
 // ============================================================
 (async () => {
-  const c = await window.tree.checkClaude();
-  if (!c.ok) {
-    pushChat('error', c.error || 'Claude is unavailable. Install the CLI and sign in.');
-  } else {
-    pushChat('system', `Claude ${c.version} · subscription · ${c.cliPath}`);
-  }
+  try {
+    const p = await window.tree.detectProviders();
+    const found = [];
+    if (p.claude) found.push('claude');
+    if (p.codex) found.push('codex');
+    if (p.shell) found.push('shell');
+    const stamp = $('#stamp-sub');
+    if (stamp && !state.root) stamp.textContent = `providers: ${found.join(' · ')}`;
+  } catch {}
 })();
