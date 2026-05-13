@@ -264,12 +264,14 @@ else
         fail "timed out waiting for workflow to start"
         exit 2
       fi
+      # Filter out completed runs so we don't latch onto a previous
+      # failed attempt with the same tag.
       run_id="$(gh run list \
         --workflow=release.yml \
         --event=push \
         --limit 20 \
-        --json databaseId,headBranch \
-        -q "[.[] | select(.headBranch == \"$tag\")] | .[0].databaseId" 2>/dev/null || true)"
+        --json databaseId,headBranch,status \
+        -q "[.[] | select(.headBranch == \"$tag\" and .status != \"completed\")] | .[0].databaseId" 2>/dev/null || true)"
       [ -z "$run_id" ] && sleep 5
     done
     ok "run $run_id queued (https://github.com/$repo_slug/actions/runs/$run_id)"
