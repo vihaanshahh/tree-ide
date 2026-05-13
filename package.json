@@ -14,11 +14,11 @@
     "dev": "electron . --enable-logging",
     "postinstall": "electron-rebuild -f -w node-pty",
     "build:icon": "node scripts/build-icns.js",
-    "dist": "npm run build:icon && electron-builder --mac dmg --arm64 --x64",
-    "dist:arm64": "npm run build:icon && electron-builder --mac dmg --arm64",
-    "dist:x64": "npm run build:icon && electron-builder --mac dmg --x64",
-    "dist:universal": "npm run build:icon && electron-builder --mac dmg --universal",
-    "dist:win": "npm run build:icon && electron-builder --win nsis --x64"
+    "dist": "npm run build:icon && electron-builder --mac dmg --arm64 --x64 --publish never",
+    "dist:arm64": "npm run build:icon && electron-builder --mac dmg --arm64 --publish never",
+    "dist:x64": "npm run build:icon && electron-builder --mac dmg --x64 --publish never",
+    "dist:universal": "npm run build:icon && electron-builder --mac dmg --universal --publish never",
+    "dist:win": "npm run build:icon && electron-builder --win nsis --x64 --publish never"
   },
   "build": {
     "appId": "ai.fluidstate.tree",
