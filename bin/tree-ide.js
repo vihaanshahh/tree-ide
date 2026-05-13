@@ -45,7 +45,11 @@ try {
 }
 
 const appRoot = path.resolve(__dirname, '..');
-const child = spawn(electron, [appRoot, '--open', target], {
+const child = spawn(electron, [
+  '--js-flags=--max-old-space-size=4096',
+  appRoot,
+  '--open', target,
+], {
   stdio: 'inherit',
   env: process.env,
 });

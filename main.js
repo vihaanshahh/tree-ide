@@ -11,11 +11,38 @@
 const { app, BrowserWindow, ipcMain, dialog, Menu, nativeImage } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const zlib = require('zlib');
 const { spawn } = require('child_process');
 const pty = require('node-pty');
 const chokidar = require('chokidar');
 const { buildGraph } = require('./src/scanner');
+
+// =======================================================================
+// Linux / WSL compatibility switches — must run before app.whenReady().
+//
+// On WSLg, Chromium's GPU init reliably fails and the user-namespace
+// sandbox is often unavailable, so without these switches the window
+// either never paints or never opens at all. We also pin ozone to X11
+// on Linux because Electron 33's Wayland integration is still flaky on
+// many setups (XWayland handles X11 clients fine in either case).
+// =======================================================================
+function isWSL() {
+  if (process.platform !== 'linux') return false;
+  if (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP) return true;
+  try { return /microsoft|WSL/i.test(fs.readFileSync('/proc/version', 'utf8')); }
+  catch { return false; }
+}
+if (process.platform === 'linux') {
+  app.commandLine.appendSwitch('ozone-platform', 'x11');
+}
+if (isWSL()) {
+  app.disableHardwareAcceleration();
+  app.commandLine.appendSwitch('no-sandbox');
+  app.commandLine.appendSwitch('disable-gpu');
+}
+// Lift the renderer's V8 heap so big repos don't crash the canvas.
+app.commandLine.appendSwitch('js-flags', '--max-old-space-size=4096');
 
 // =======================================================================
 // Build the app icon (the same directory-tree logo used in the titlebar)
@@ -260,8 +287,21 @@ ipcMain.handle('dialog:openFolder', async () => {
   return result.filePaths[0];
 });
 
+function isTooBroad(p) {
+  const norm = path.resolve(p);
+  const home = os.homedir();
+  if (norm === '/' || norm === home) return true;
+  // Common "containers of repos" — opening one walks every project at once.
+  const broad = new Set(['/home', '/Users', '/mnt', '/mnt/c', '/mnt/d', '/root', '/tmp']);
+  if (broad.has(norm)) return true;
+  return false;
+}
+
 ipcMain.handle('repo:scan', async (_evt, rootPath) => {
   if (!rootPath || !fs.existsSync(rootPath)) return { error: 'Path does not exist' };
+  if (isTooBroad(rootPath)) {
+    return { error: `${rootPath} is too broad — open a single project folder instead.` };
+  }
   currentRoot = rootPath;
   send('repo:scan-progress', { status: 'scanning', root: rootPath });
   try {
