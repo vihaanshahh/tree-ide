@@ -35,6 +35,7 @@ check_node_version() {
   v=$(node -v 2>/dev/null | sed 's/^v//' | cut -d. -f1)
   [ -z "$v" ] && error "Node.js is not installed."
   [ "$v" -lt 18 ] && error "Node.js 18+ required (found v$v)."
+  return 0
 }
 
 resolve_tag() {
@@ -88,8 +89,10 @@ main() {
   info "Installing dependencies (this includes a native rebuild of node-pty)..."
   ( cd "$install_dir" && npm install )
 
+  install_launcher "$install_dir"
+
   success "Tree IDE installed at $install_dir"
-  printf "\n  Launch with:\n    ${GREEN}cd $install_dir && npm start${NC}\n\n"
+  printf "\n  Launch with:\n    ${GREEN}%s${NC}\n\n" "${LAUNCH_HINT:-cd $install_dir && npm start}"
 
   # Auto-launch unless the user opted out.
   if [ "${TREE_IDE_NO_LAUNCH:-0}" = "1" ]; then
@@ -97,6 +100,52 @@ main() {
   else
     info "Starting Tree IDE..."
     ( cd "$install_dir" && npm start )
+  fi
+}
+
+install_launcher() {
+  local app_dir="$1"
+  local app_bin="$app_dir/bin/tree-ide.js"
+  chmod +x "$app_bin" 2>/dev/null || true
+
+  local target_dir=""
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) target_dir="$HOME/.local/bin" ;;
+    *":/usr/local/bin:"*)   target_dir="/usr/local/bin" ;;
+  esac
+
+  if [ -z "$target_dir" ]; then
+    mkdir -p "$HOME/.local/bin"
+    target_dir="$HOME/.local/bin"
+    warn "$target_dir is not on your PATH. Add this to your shell profile:"
+    printf "    ${GREEN}export PATH=\"\$HOME/.local/bin:\$PATH\"${NC}\n"
+  fi
+
+  local sudo_cmd=""
+  if [ ! -w "$target_dir" ]; then
+    if command -v sudo >/dev/null 2>&1; then
+      sudo_cmd="sudo"
+    else
+      warn "$target_dir is not writable. Skipping launcher install."
+      return 0
+    fi
+  fi
+
+  $sudo_cmd ln -sf "$app_bin" "$target_dir/tree-ide"
+  success "Installed command: tree-ide → $target_dir/tree-ide"
+  LAUNCH_HINT="tree-ide ."
+
+  # Also expose as `tree` if nothing else owns that name.
+  local existing
+  existing=$(command -v tree 2>/dev/null || true)
+  if [ -z "$existing" ]; then
+    $sudo_cmd ln -sf "$app_bin" "$target_dir/tree"
+    success "Installed command: tree → $target_dir/tree"
+    LAUNCH_HINT="tree ."
+  elif [ -L "$existing" ] && [ "$(readlink "$existing")" = "$app_bin" ]; then
+    LAUNCH_HINT="tree ."
+  else
+    warn "Not aliasing 'tree' — $existing already exists. Use 'tree-ide' instead."
   fi
 }
 
