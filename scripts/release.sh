@@ -75,6 +75,15 @@ done
 
 # ─── output ───────────────────────────────────────────────────────────────────
 
+# If the secret isn't in the environment, try the macOS keychain so
+# devs don't need to re-export it every shell. Falls through silently
+# if the keychain entry isn't there.
+if [ -z "${FS_LANDING_REVALIDATE_SECRET:-}" ] && command -v security >/dev/null 2>&1; then
+  kc_secret="$(security find-generic-password -a "$USER" -s "FS_LANDING_REVALIDATE_SECRET" -w 2>/dev/null || true)"
+  [ -n "$kc_secret" ] && export FS_LANDING_REVALIDATE_SECRET="$kc_secret"
+  unset kc_secret
+fi
+
 if [ -t 2 ]; then
   C_DIM='\033[2m'; C_BOLD='\033[1m'
   C_BLUE='\033[34m'; C_GREEN='\033[32m'; C_YELLOW='\033[33m'; C_RED='\033[31m'
