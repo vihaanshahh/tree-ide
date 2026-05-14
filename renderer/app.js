@@ -981,6 +981,61 @@ renderRecentRepos();
 })();
 
 // ============================================================
+// Update banner — surface a "Update & restart" button in the titlebar
+// whenever the local version is behind the latest GitHub release.
+// ============================================================
+const updateBtn = $('#update-btn');
+const updateBtnLabel = $('#update-btn-label');
+let updateInfo = null;
+
+function showUpdateBanner(info) {
+  if (!updateBtn || !info || !info.isNewer) {
+    updateBtn?.classList.add('hidden');
+    return;
+  }
+  updateInfo = info;
+  updateBtn.classList.remove('hidden');
+  updateBtn.disabled = false;
+  updateBtnLabel.textContent = info.gitCheckout
+    ? `Update to v${info.latest} & restart`
+    : `v${info.latest} available — get build`;
+  updateBtn.title = info.gitCheckout
+    ? `You're on v${info.current}. Latest release is v${info.latest}. Click to git pull, npm install, and relaunch.`
+    : `You're on v${info.current}. Latest release is v${info.latest}. This isn't a git checkout, so the button opens the GitHub release page.`;
+}
+
+async function checkForUpdate() {
+  if (!window.tree?.checkUpdate) return;
+  try {
+    const info = await window.tree.checkUpdate();
+    if (info && info.isNewer) showUpdateBanner(info);
+    else updateBtn?.classList.add('hidden');
+  } catch {}
+}
+
+updateBtn?.addEventListener('click', async () => {
+  if (!updateInfo || !window.tree?.updateAndRelaunch) return;
+  updateBtn.disabled = true;
+  updateBtnLabel.textContent = updateInfo.gitCheckout ? 'Updating…' : 'Opening…';
+  const result = await window.tree.updateAndRelaunch();
+  if (result && result.error) {
+    updateBtnLabel.textContent = `Update failed`;
+    updateBtn.title = result.error;
+    updateBtn.disabled = false;
+  }
+});
+
+window.tree?.onUpdateProgress?.((evt) => {
+  if (!updateBtn || !updateBtnLabel) return;
+  const map = { fetching: 'Fetching…', pulling: 'Pulling…', installing: 'Installing…', relaunching: 'Relaunching…' };
+  if (map[evt?.status]) updateBtnLabel.textContent = map[evt.status];
+});
+
+// Initial check shortly after launch, then every 30 minutes while open.
+setTimeout(checkForUpdate, 2500);
+setInterval(checkForUpdate, 30 * 60 * 1000);
+
+// ============================================================
 // Multi-agent terminals
 //
 // Each agent is an xterm.js tile backed by a PTY. The focused tile becomes the

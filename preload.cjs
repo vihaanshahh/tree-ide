@@ -46,4 +46,15 @@ contextBridge.exposeInMainWorld('tree', {
     return () => ipcRenderer.removeListener('repo:scan-progress', fn);
   },
   onMenuOpenFolder: (cb) => { ipcRenderer.on('menu:open-folder', () => cb()); },
+
+  // Update check — surfaces a Restart/Update affordance in the titlebar
+  // when the local version is behind the latest GitHub release.
+  checkUpdate: () => ipcRenderer.invoke('app:check-update'),
+  relaunchApp: () => ipcRenderer.invoke('app:relaunch'),
+  updateAndRelaunch: () => ipcRenderer.invoke('app:update-and-relaunch'),
+  onUpdateProgress: (cb) => {
+    const fn = (_e, evt) => cb(evt);
+    ipcRenderer.on('app:update-progress', fn);
+    return () => ipcRenderer.removeListener('app:update-progress', fn);
+  },
 });

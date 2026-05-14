@@ -1274,6 +1274,39 @@ body.view-agents #agents-grid[data-count="1"] .agent-tile {
   color: var(--color-ghost-sand);
 }
 
+/* Titlebar update affordance — only visible when a newer release exists. */
+.update-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--color-ghost-sand);
+  color: var(--color-midnight-void);
+  border: 1px solid var(--color-ghost-sand);
+  padding: 7px 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: var(--tracking-mono);
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.update-btn:hover {
+  background: var(--color-midnight-void);
+  color: var(--color-ghost-sand);
+}
+.update-btn:disabled { opacity: 0.6; cursor: progress; }
+.update-btn.hidden { display: none; }
+.update-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: hsl(8, 70%, 52%);
+  box-shadow: 0 0 0 2px rgba(255, 90, 70, 0.18);
+  flex-shrink: 0;
+}
+.update-btn:hover .update-dot {
+  box-shadow: 0 0 0 2px rgba(255, 90, 70, 0.3);
+}
+
 /* ---------- Activity log ---------- */
 #log-list {
   flex: 1;

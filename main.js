@@ -8,15 +8,19 @@
 //     if a file changes on disk, the graph reflects it, no matter who
 //     wrote it.
 
-const { app, BrowserWindow, ipcMain, dialog, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Menu, nativeImage, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const https = require('https');
 const zlib = require('zlib');
 const { spawn } = require('child_process');
 const pty = require('node-pty');
 const chokidar = require('chokidar');
 const { buildGraph } = require('./src/scanner');
+const pkg = require('./package.json');
+
+const UPDATE_REPO = 'vihaanshahh/tree-ide';
 
 // =======================================================================
 // Linux / WSL compatibility switches — must run before app.whenReady().
@@ -274,6 +278,103 @@ function detectProviders() {
 
 ipcMain.handle('providers:detect', async () => detectProviders());
 ipcMain.handle('app:startup-root', async () => startupRoot);
+
+// =======================================================================
+// Update check — polls GitHub releases for a newer tag than package.json.
+// Surfaces in the titlebar so the user can pull + relaunch without leaving
+// the app when their checkout is behind.
+// =======================================================================
+function compareVersions(a, b) {
+  const split = (v) => String(v || '').replace(/^v/, '').split(/[.-]/).map(s => /^\d+$/.test(s) ? parseInt(s, 10) : s);
+  const pa = split(a), pb = split(b);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i] ?? 0, y = pb[i] ?? 0;
+    if (typeof x === 'number' && typeof y === 'number') {
+      if (x !== y) return x - y;
+    } else if (String(x) !== String(y)) {
+      return String(x) < String(y) ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+function fetchLatestRelease() {
+  return new Promise((resolve, reject) => {
+    const req = https.get(
+      `https://api.github.com/repos/${UPDATE_REPO}/releases/latest`,
+      { headers: { 'User-Agent': 'tree-ide-update-check', 'Accept': 'application/vnd.github+json' } },
+      (res) => {
+        if (res.statusCode !== 200) {
+          res.resume();
+          return reject(new Error(`HTTP ${res.statusCode}`));
+        }
+        let body = '';
+        res.on('data', (c) => body += c);
+        res.on('end', () => {
+          try {
+            const j = JSON.parse(body);
+            resolve({
+              tag: String(j.tag_name || '').replace(/^v/, ''),
+              htmlUrl: j.html_url || `https://github.com/${UPDATE_REPO}/releases`,
+            });
+          } catch (e) { reject(e); }
+        });
+      }
+    );
+    req.setTimeout(8000, () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+  });
+}
+
+function isGitCheckout() {
+  try { return fs.statSync(path.join(__dirname, '.git')).isDirectory() || fs.existsSync(path.join(__dirname, '.git')); }
+  catch { return false; }
+}
+
+ipcMain.handle('app:check-update', async () => {
+  try {
+    const latest = await fetchLatestRelease();
+    const current = pkg.version;
+    const isNewer = !!latest.tag && compareVersions(latest.tag, current) > 0;
+    return { current, latest: latest.tag, isNewer, htmlUrl: latest.htmlUrl, gitCheckout: isGitCheckout() };
+  } catch (e) {
+    return { current: pkg.version, error: e.message || String(e) };
+  }
+});
+
+ipcMain.handle('app:relaunch', async () => {
+  app.relaunch();
+  app.exit(0);
+  return { ok: true };
+});
+
+ipcMain.handle('app:update-and-relaunch', async () => {
+  if (!isGitCheckout()) {
+    try { await shell.openExternal(`https://github.com/${UPDATE_REPO}/releases/latest`); } catch {}
+    return { error: 'Not a git checkout — opened the releases page so you can grab the new build.' };
+  }
+  const run = (cmd, args) => new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { cwd: __dirname, env: process.env });
+    let stderr = '';
+    child.stderr.on('data', (d) => stderr += d.toString());
+    child.on('error', reject);
+    child.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`${cmd} exited ${code}: ${stderr.trim()}`)));
+  });
+  try {
+    send('app:update-progress', { status: 'fetching' });
+    await run('git', ['fetch', '--tags', '--quiet']);
+    send('app:update-progress', { status: 'pulling' });
+    await run('git', ['pull', '--ff-only', '--quiet']);
+    send('app:update-progress', { status: 'installing' });
+    await run('npm', ['install', '--no-audit', '--no-fund', '--silent']);
+    send('app:update-progress', { status: 'relaunching' });
+    app.relaunch();
+    app.exit(0);
+    return { ok: true };
+  } catch (e) {
+    return { error: e.message || String(e) };
+  }
+});
 
 // =======================================================================
 // Folder open + repo scan

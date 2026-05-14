@@ -570,7 +570,9 @@ class Graph {
     return 'support';
   }
 
-  // Best display label for a file
+  // Best display label for a file. Generic kinds (store, job, service…) get
+  // their filename or sublabel — "Store" or "Job" alone is uninformative when
+  // the layer has 30 of them.
   displayLabel(f) {
     if (!f) return '';
     if (f.kind === 'route' && f.sublabel) {
@@ -585,6 +587,22 @@ class Graph {
     }
     if (['config', 'infra', 'docs', 'schema'].includes(f.kind) && (f.sublabel || f.filename)) {
       return f.sublabel || f.filename;
+    }
+    // Stores, jobs, services, server-actions, tests, styles, models —
+    // scanner labels these "Store"/"Job"/"Server"/etc which is too generic.
+    // Prefer the filename so two stores in the same layer are distinguishable.
+    const generic = ['store', 'job', 'service', 'server-action', 'test', 'styles', 'model'];
+    if (generic.includes(f.kind)) {
+      const name = f.sublabel || (f.filename ? f.filename.replace(/\.[^.]+$/, '') : '') || f.id;
+      // Disambiguate generic basenames (index, main, route, server) with the
+      // parent folder so the user can tell "stores/cart/index" from
+      // "stores/user/index" at a glance.
+      const GENERIC_BASENAMES = new Set(['index', 'main', 'route', 'server', 'app', 'handler', 'router']);
+      if (GENERIC_BASENAMES.has(String(name).toLowerCase()) && f.dir) {
+        const folder = f.dir.split('/').pop();
+        if (folder) return `${folder}/${name}`;
+      }
+      return name;
     }
     if (f.kind === 'middleware') return 'middleware';
     return f.label || f.filename || f.id;
@@ -823,11 +841,12 @@ class Graph {
     const stat = (arr, p) => arr.length ? arr[Math.min(arr.length - 1, Math.floor(arr.length * p))] : 0;
 
     // Decide how wide each layer column should be, dynamically and per content.
-    //   - Tables → single-column, fit widest table fully (no truncation).
-    //   - Endpoints → pack at the 60th-percentile width × 2 so most fit 2-up,
-    //     long-path endpoints wrap to their own row inside the column.
-    //   - Pages / Components → median × 2.
-    //   - Support → single column at widest.
+    // The diagram is meant to grow SIDEWAYS, not down — so for crowded layers
+    // we scale columns with sqrt(count) and bias toward more side-by-side
+    // packing instead of letting one section run hundreds of rows tall.
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const sqrtCols = (count, maxCols, divisor = 1.5) =>
+      clamp(Math.round(Math.sqrt(Math.max(1, count)) / divisor), 1, maxCols);
     const layerColWidth = (lid) => {
       const ws = widthsByLayer[lid];
       if (!ws || !ws.length) return PILL_MIN_W;
@@ -840,9 +859,8 @@ class Graph {
       if (buckets.has('endpoint')) {
         const p60 = stat(ws, 0.6);
         const med = stat(ws, 0.5);
-        const cols = density === 'small'
-          ? Math.min(3, Math.max(1, Math.ceil(Math.sqrt(Math.max(1, count)))))
-          : 2;
+        const maxCols = density === 'small' ? 4 : density === 'medium' ? 5 : 6;
+        const cols = sqrtCols(count, maxCols, 1.8);
         const endpointGroups = new Map();
         for (const f of buckets.get('endpoint') || []) {
           const key = endpointPathOf(f);
@@ -859,19 +877,13 @@ class Graph {
         return Math.ceil(Math.max(med * cols + ITEM_GAP * (cols - 1), p60 + 24, groupedW + 20) + 16);
       }
       if (lid === 'support') {
-        const cols = density === 'small'
-          ? (count <= 8 ? 2 : count <= 32 ? 3 : 4)
-          : density === 'medium' && count > 30
-            ? 3
-            : 1;
+        const maxCols = density === 'small' ? 4 : density === 'medium' ? 5 : 6;
+        const cols = sqrtCols(count, maxCols, 1.8);
         return Math.ceil(Math.max(max, stat(ws, 0.5) * cols + ITEM_GAP * (cols - 1)) + 16);
       }
       const med = stat(ws, 0.5);
-      const cols = density === 'small'
-        ? (count <= 4 ? 1 : count <= 16 ? 2 : 3)
-        : density === 'medium'
-          ? (count <= 12 ? 2 : 3)
-          : 2;
+      const maxCols = density === 'small' ? 4 : density === 'medium' ? 6 : 8;
+      const cols = sqrtCols(count, maxCols, 1.5);
       return Math.ceil(Math.max(max + 16, med * cols + ITEM_GAP * (cols - 1) + 24));
     };
 
@@ -886,25 +898,39 @@ class Graph {
       return;
     }
 
-    // ---- 4. Position columns side-by-side, centered around x=0 ----
-    const totalW = activeLayers.reduce((s, x) => s + x.w, 0) + COL_GAP * (activeLayers.length - 1);
-    let xCursor = -totalW / 2;
-    this.layers = [];
-    for (const { L, w } of activeLayers) {
+    // ---- 4. Build each layer at x=0 first, then center horizontally ----
+    // We defer horizontal placement so bin-packing inside a layer (which can
+    // widen the layer beyond its initial subColW) doesn't throw off the
+    // overall centering. After every layer's final width is known, a second
+    // pass shifts them into place.
+    const builtLayers = [];
+    for (const { L, w: subColW } of activeLayers) {
       const layer = {
         id: L.id, name: L.name, sections: [],
-        x: xCursor, y: topPad, w, h: 0,
+        x: 0, y: topPad, w: subColW, h: 0,
       };
-      // ---- 5. Lay out sections vertically inside the column ----
+      // ---- 5a. Lay out sections vertically inside one sub-column ----
       let yCursor = layer.y + 6;
       let lastBottom = yCursor;
 
       const orderedKinds = L.kinds.filter(k => byLayer[L.id].has(k));
-      // Kinds we never collapse / cap: schema-y data and endpoints. The user
-      // wants the full data layer always visible.
-      const ALWAYS_FULL = new Set(['table', 'schema', 'endpoint', 'middleware', 'server-action']);
+      // Kinds where clustering by folder makes a crowded section legible.
+      // Beyond a threshold we split the section into one mini-section per
+      // folder so 200 components are presented as a handful of nameable
+      // groups instead of a wall.
+      const DIR_GROUPED = new Set(['component', 'hook', 'store', 'job', 'service', 'server-action', 'model', 'styles', 'test', 'module']);
+      const FOLDER_SPLIT_THRESHOLD = 40;
+      const dirKey = (f) => {
+        const d = f.dir || '';
+        if (!d) return '';
+        return d.split('/').pop() || d;
+      };
+
+      // First sort each kind's files; then optionally split into per-folder
+      // sub-sections. We never cap or hide anything — bin-packing handles the
+      // resulting height.
+      const units = [];
       for (const k of orderedKinds) {
-        yCursor = Math.max(yCursor, lastBottom + SAFE_GAP);
         const allK = byLayer[L.id].get(k).slice().sort((a, b) => {
           if (k === 'table' && a.parentFile && b.parentFile && a.parentFile !== b.parentFile) {
             return a.parentFile.localeCompare(b.parentFile);
@@ -919,36 +945,59 @@ class Graph {
             if (a.parentFile && b.parentFile && a.parentFile !== b.parentFile) return a.parentFile.localeCompare(b.parentFile);
             return a.id.localeCompare(b.id);
           }
+          if (DIR_GROUPED.has(k)) {
+            const da = dirKey(a);
+            const db = dirKey(b);
+            if (da !== db) return da.localeCompare(db);
+          }
           const ia = this.importance.get(a.id) || 0;
           const ib = this.importance.get(b.id) || 0;
           if (ia !== ib) return ib - ia;
           return (this.displayLabel(a) || '').localeCompare(this.displayLabel(b) || '');
         });
-        const expanded = this.expandedSections.has(k);
-        const adaptiveCap = density === 'small' ? Infinity : density === 'medium' ? Math.max(this.SECTION_CAP, 48) : this.SECTION_CAP;
-        const cap = ALWAYS_FULL.has(k) ? Infinity : adaptiveCap;
-        const visibleCount = expanded ? allK.length : Math.min(cap, allK.length);
-        const filesK = allK.slice(0, visibleCount);
-        if (this.searchQuery) {
-          const already = new Set(filesK.map(f => f.id));
-          for (const f of allK) {
-            if (this.matchSet.has(f.id) && !already.has(f.id)) {
-              filesK.push(f);
-              already.add(f.id);
-            }
-          }
-        }
-        const visibleIds = new Set(filesK.map(f => f.id));
-        const hiddenK = allK.filter(f => !visibleIds.has(f.id));
-        for (const f of hiddenK) f.hidden = true;
 
+        if (DIR_GROUPED.has(k) && allK.length > FOLDER_SPLIT_THRESHOLD) {
+          const folderGroups = new Map();
+          for (const f of allK) {
+            const folder = dirKey(f) || '·';
+            if (!folderGroups.has(folder)) folderGroups.set(folder, []);
+            folderGroups.get(folder).push(f);
+          }
+          const folders = [...folderGroups.entries()].sort((a, b) => {
+            if (a[1].length !== b[1].length) return b[1].length - a[1].length;
+            return a[0].localeCompare(b[0]);
+          });
+          for (const [folder, files] of folders) {
+            units.push({
+              kind: k,
+              name: folder === '·' ? (KIND_PRETTY[k] || k) : `${KIND_PRETTY[k] || k} · ${folder}`,
+              files,
+              allCount: files.length,
+            });
+          }
+        } else {
+          units.push({
+            kind: k,
+            name: KIND_PRETTY[k] || k,
+            files: allK,
+            allCount: allK.length,
+          });
+        }
+      }
+
+      for (const u of units) {
+        const k = u.kind;
+        const filesK = u.files;
+        for (const f of filesK) f.hidden = false;
+
+        yCursor = Math.max(yCursor, lastBottom + SAFE_GAP);
         const section = {
-          kind: k, name: KIND_PRETTY[k] || k,
+          kind: k, name: u.name,
           files: filesK,
-          allCount: allK.length,
-          hiddenCount: hiddenK.length,
-          canExpand: hiddenK.length > 0,
-          expanded,
+          allCount: u.allCount,
+          hiddenCount: 0,
+          canExpand: false,
+          expanded: true,
           x: layer.x + 6, y: yCursor, w: layer.w - 12, h: 0,
         };
 
@@ -991,16 +1040,11 @@ class Graph {
             f._endpointPath = '';
             f._endpointVerb = '';
             const labelW = measureLabel(f, fontPills);
-            // Nodes stay boxy, but labels are allowed to wrap before they
-            // collide with neighboring boxes. Endpoints get one extra line
-            // because route strings are naturally longer.
             const cap = PILL_MAX_W;
             w = Math.max(PILL_MIN_W, Math.min(cap, labelW));
             const imp = this.importance.get(f.id) || 0;
             f._importance = imp;
             w = Math.min(cap, Math.ceil(w + Math.min(36, Math.log2(imp + 1) * 6)));
-            // Cap any single item to the column's inner width so it never
-            // visually overflows the column on the right.
             if (w > innerW) w = innerW;
             const labelMaxW = Math.max(20, w - PILL_PAD_X * 2);
             f._labelLines = this.wrapLabel(ctx, this.displayLabel(f), labelMaxW, f.kind === 'endpoint' ? 3 : 2);
@@ -1065,10 +1109,64 @@ class Graph {
         yCursor = lastBottom + SECTION_GAP;
       }
 
-      layer.h = lastBottom - layer.y;
-      this.layers.push(layer);
-      xCursor += w + COL_GAP;
+      layer.h = Math.max(0, lastBottom - layer.y);
+
+      // ---- 5b. Bin-pack sections into multiple sub-columns when the layer
+      //          is much taller than wide. This is what lets a big repo
+      //          grow horizontally: instead of one tower of 25 sections, we
+      //          place sections greedily into the shortest available
+      //          sub-column. Nothing is hidden — only re-positioned.
+      const SUB_GAP = COL_GAP;
+      // Roughly target an aspect ratio of 1:1.4 (height ≈ 1.4 × width) before
+      // splitting into another sub-column. Always allow at least one sub-col
+      // and cap at 6 so the overall diagram stays browsable.
+      const aspectTarget = Math.max(700, subColW * 1.4);
+      let K = 1;
+      if (layer.sections.length > 1 && layer.h > aspectTarget) {
+        K = Math.min(layer.sections.length, 6, Math.ceil(layer.h / aspectTarget));
+      }
+      if (K > 1) {
+        const colHeights = new Array(K).fill(layer.y + 6);
+        for (const s of layer.sections) {
+          let best = 0;
+          for (let i = 1; i < K; i++) if (colHeights[i] < colHeights[best]) best = i;
+          const newX = layer.x + 6 + best * (subColW + SUB_GAP);
+          const newY = colHeights[best];
+          const dx = newX - s.x;
+          const dy = newY - s.y;
+          s.x += dx;
+          s.y += dy;
+          for (const f of s.files) {
+            if (f.hidden) continue;
+            f.x += dx;
+            f.y += dy;
+          }
+          colHeights[best] = s.y + s.h + SECTION_GAP;
+        }
+        layer.w = K * subColW + (K - 1) * SUB_GAP;
+        layer.h = Math.max(...colHeights) - layer.y;
+      }
+
+      builtLayers.push(layer);
     }
+
+    // ---- 6. Center the finished layers horizontally. ----
+    const finalTotalW = builtLayers.reduce((s, l) => s + l.w, 0) + COL_GAP * Math.max(0, builtLayers.length - 1);
+    let xCursor = -finalTotalW / 2;
+    for (const layer of builtLayers) {
+      const dx = xCursor - layer.x;
+      if (dx !== 0) {
+        layer.x = xCursor;
+        for (const s of layer.sections) {
+          s.x += dx;
+          for (const f of s.files) {
+            if (!f.hidden) f.x += dx;
+          }
+        }
+      }
+      xCursor += layer.w + COL_GAP;
+    }
+    this.layers = builtLayers;
 
     // AI is no longer rendered on the canvas
     this.aiNode.x = -99999;
@@ -1561,18 +1659,7 @@ class Graph {
         ctx.moveTo(s.x + 2, s.y + 20);
         ctx.lineTo(s.x + s.w - 4, s.y + 20);
         ctx.stroke();
-        // "+N more" / "show less" affordance
-        if (s.canExpand) {
-          const isHoverExpand = this.hovered && this.hovered.kind === 'expand' && this.hovered.sectionKind === s.kind;
-          ctx.font = `400 11px ${FONT_MONO}`;
-          ctx.fillStyle = `rgba(${SAND}, ${isHoverExpand ? 0.95 : 0.55})`;
-          ctx.fillText(`+ ${s.hiddenCount} more — click to expand`, s.x + 2, s.y + s.h - 14);
-        } else if (s.expanded && s.allCount > this.SECTION_CAP) {
-          const isHoverExpand = this.hovered && this.hovered.kind === 'expand' && this.hovered.sectionKind === s.kind;
-          ctx.font = `400 11px ${FONT_MONO}`;
-          ctx.fillStyle = `rgba(${SAND}, ${isHoverExpand ? 0.95 : 0.55})`;
-          ctx.fillText(`— collapse`, s.x + 2, s.y + s.h - 14);
-        }
+        // Sections show everything now — no "+N more" / "collapse" affordance.
       }
     }
 
