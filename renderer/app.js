@@ -948,6 +948,148 @@ function shorten(p) {
 
 $('#open-folder-btn').addEventListener('click', () => openRepo());
 $('#welcome-open').addEventListener('click', () => openRepo());
+
+// ============================================================
+// Toast notifications — visible error surface so problems don't
+// look like a silent freeze. window.treeNotify is also called from
+// graph.js + transport.js when they catch errors of their own.
+// ============================================================
+const TOAST_DEFAULT_MS = 6500;
+let lastToastKey = '';
+let lastToastAt  = 0;
+function showToast(msg, level = 'info', durationMs = TOAST_DEFAULT_MS) {
+  const stack = document.getElementById('toast-stack');
+  if (!stack || !msg) return;
+  // Coalesce identical bursts (e.g. resize errors firing every frame).
+  const key = level + '|' + msg;
+  const now = Date.now();
+  if (key === lastToastKey && now - lastToastAt < 1500) return;
+  lastToastKey = key; lastToastAt = now;
+
+  const el = document.createElement('div');
+  el.className = 'toast toast-' + (['error','warn','info'].includes(level) ? level : 'info');
+  el.textContent = String(msg);
+  const close = document.createElement('button');
+  close.className = 'toast-close';
+  close.setAttribute('aria-label', 'Dismiss');
+  close.textContent = '×';
+  close.addEventListener('click', () => dismiss());
+  el.appendChild(close);
+  stack.appendChild(el);
+
+  let removed = false;
+  const dismiss = () => {
+    if (removed) return;
+    removed = true;
+    el.classList.add('toast-fade');
+    setTimeout(() => { try { el.remove(); } catch {} }, 260);
+  };
+  if (durationMs > 0) setTimeout(dismiss, durationMs);
+
+  // Keep at most 5 toasts on screen.
+  while (stack.childElementCount > 5) stack.removeChild(stack.firstChild);
+}
+window.treeNotify = (msg, level, durationMs) => showToast(msg, level, durationMs);
+
+// ============================================================
+// SSH connect modal — wraps `ssh -L … tree-ide --serve` for an
+// in-app "pick remote as a repo" experience. Only available
+// inside Electron; the web/browser path doesn't have ssh access.
+// ============================================================
+function openSshModal() {
+  if (!window.electronNative || !window.electronNative.connectSsh) {
+    showToast('Remote SSH is only available in the desktop app.', 'warn');
+    return;
+  }
+  const modal = $('#ssh-modal');
+  if (!modal) return;
+  const status = $('#ssh-status');
+  if (status) { status.textContent = ''; status.classList.add('hidden'); }
+  modal.classList.remove('hidden');
+  const host = $('#ssh-host');
+  setTimeout(() => { try { host && host.focus(); } catch {} }, 30);
+}
+function closeSshModal() {
+  $('#ssh-modal')?.classList.add('hidden');
+  const btn = $('#ssh-connect');
+  if (btn) { btn.disabled = false; btn.textContent = 'Connect'; }
+}
+async function connectSshFromModal() {
+  const btn      = $('#ssh-connect');
+  const status   = $('#ssh-status');
+  const host     = ($('#ssh-host')?.value || '').trim();
+  const path     = ($('#ssh-path')?.value || '').trim();
+  const identity = ($('#ssh-identity')?.value || '').trim();
+  if (!host) {
+    if (status) { status.textContent = 'SSH host is required (e.g. user@host).'; status.className = 'ssh-status error'; }
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = 'Connecting…'; }
+  if (status) { status.textContent = `Opening ssh tunnel to ${host}\nWaiting for tree-ide on remote…`; status.className = 'ssh-status info'; }
+  try {
+    const res = await window.electronNative.connectSsh({ host, path, identity });
+    if (res && res.ok && res.url) {
+      if (status) { status.textContent = 'Connected. Loading remote workspace…'; status.className = 'ssh-status info'; }
+      // Navigate the Electron window to the tunneled remote URL.
+      // The remote server is serving the same renderer, so the page
+      // reloads against the remote backend and the user sees their
+      // remote repo in the same window.
+      setTimeout(() => { window.location.href = res.url; }, 150);
+    } else {
+      const msg = (res && res.error) || 'Connection failed for an unknown reason.';
+      if (status) { status.textContent = msg; status.className = 'ssh-status error'; }
+      showToast('SSH connect failed: ' + msg.split('\n')[0], 'error', 8000);
+      if (btn) { btn.disabled = false; btn.textContent = 'Connect'; }
+    }
+  } catch (e) {
+    const msg = (e && e.message) || String(e);
+    if (status) { status.textContent = msg; status.className = 'ssh-status error'; }
+    showToast('SSH connect failed: ' + msg, 'error', 8000);
+    if (btn) { btn.disabled = false; btn.textContent = 'Connect'; }
+  }
+}
+$('#ssh-connect-btn')?.addEventListener('click', openSshModal);
+$('#welcome-ssh')?.addEventListener('click', openSshModal);
+$('#ssh-cancel')?.addEventListener('click', closeSshModal);
+$('#ssh-connect')?.addEventListener('click', connectSshFromModal);
+$('#ssh-modal')?.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeSshModal();
+  else if (e.key === 'Enter' && (e.target.tagName === 'INPUT')) connectSshFromModal();
+});
+// In browser/server mode (no electronNative), hide the SSH entry points.
+if (!window.electronNative || !window.electronNative.connectSsh) {
+  $('#ssh-connect-btn')?.classList.add('hidden');
+  $('#welcome-ssh')?.classList.add('hidden');
+}
+// If the ssh tunnel dies after we navigated, tell the user — otherwise
+// the page just appears to freeze when nothing is coming back over WS.
+if (window.electronNative && window.electronNative.onSshGone) {
+  window.electronNative.onSshGone((info) => {
+    const detail = info && (info.code != null ? `code ${info.code}` : info.sig ? `signal ${info.sig}` : '');
+    showToast('SSH tunnel closed' + (detail ? ` (${detail})` : '') + '. Reconnect to continue.', 'error', 0);
+  });
+}
+
+// Visible breadcrumb when the WebSocket drops. The transport auto-
+// reconnects with backoff, so we toast on the first close and dismiss
+// when it comes back instead of nagging on each retry.
+let _wsDownToast = null;
+let _wsHasOpened = false;
+if (window.tree && window.tree.onTransportOpen) {
+  window.tree.onTransportOpen(() => {
+    if (_wsHasOpened && _wsDownToast) {
+      // Use treeNotify with a short ttl as the "reconnected" signal.
+      showToast('Reconnected.', 'info', 2500);
+    }
+    _wsHasOpened = true;
+    _wsDownToast = null;
+  });
+  window.tree.onTransportClose(() => {
+    if (!_wsHasOpened || _wsDownToast) return;
+    _wsDownToast = true;
+    showToast('Lost connection to backend. Retrying…', 'warn', 4500);
+  });
+}
 $('#recent-toggle')?.addEventListener('click', (e) => {
   e.stopPropagation();
   renderRecentRepos();
@@ -960,6 +1102,7 @@ document.addEventListener('click', (e) => {
   }
 });
 window.tree.onMenuOpenFolder(() => openRepo());
+if (window.tree.onMenuOpenSsh) window.tree.onMenuOpenSsh(() => openSshModal());
 if (window.tree.onOpenRoot) {
   window.tree.onOpenRoot((evt) => {
     if (evt && evt.root) openRepo(evt.root);
@@ -1153,8 +1296,55 @@ function createAgent({ label, primary = false, provider = 'shell' } = {}) {
     relayoutAgentGrid();
   });
 
+  // Double-click the name to rename. Enter saves, Esc cancels, blur saves.
+  dom.name.title = 'Double-click to rename';
+  dom.name.addEventListener('dblclick', () => beginRenameAgent(agent));
+
   relayoutAgentGrid();
   return agent;
+}
+
+function beginRenameAgent(agent) {
+  const span = agent.dom.name;
+  if (!span || span.dataset.editing === '1') return;
+  const orig = agent.label;
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'agent-name-input';
+  input.value = orig;
+  input.maxLength = 60;
+  input.spellcheck = false;
+  input.dataset.editing = '1';
+  span.replaceWith(input);
+  agent.dom.name = input;
+  // Defer focus/select until the swap settles — otherwise blur can fire
+  // immediately and revert before the user types.
+  requestAnimationFrame(() => {
+    try { input.focus(); input.select(); } catch {}
+  });
+  let done = false;
+  const commit = (save) => {
+    if (done) return;
+    done = true;
+    const trimmed = (input.value || '').trim();
+    const next = save && trimmed ? trimmed.slice(0, 60) : orig;
+    const newSpan = document.createElement('span');
+    newSpan.className = 'agent-name';
+    newSpan.textContent = next;
+    newSpan.title = 'Double-click to rename';
+    if (input.isConnected) input.replaceWith(newSpan);
+    agent.dom.name = newSpan;
+    newSpan.addEventListener('dblclick', () => beginRenameAgent(agent));
+    agent.label = next;
+  };
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter')       { e.preventDefault(); commit(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); commit(false); }
+    // Don't let typing in the rename field hit the page-level keyboard
+    // shortcuts (e.g. ⌘O opening a folder picker).
+    e.stopPropagation();
+  });
+  input.addEventListener('blur', () => commit(true));
 }
 
 const XTERM_THEME = {
@@ -1257,11 +1447,19 @@ function relayoutAgentGrid() {
   if (cEl) cEl.textContent = String(state.agents.size);
 }
 
-// Refit terminals when the tab/window shows them.
+// Refit terminals when the tab/window shows them. macOS's fullscreen
+// transition fires a burst of resize events; xterm's fit walks every
+// line, so refitting per tick on every agent terminal can hang the
+// renderer. Coalesce to one fit-pass per animation frame.
+let pendingTermFit = 0;
 window.addEventListener('resize', () => {
-  for (const a of state.agents.values()) {
-    if (a.fitAddon) try { a.fitAddon.fit(); } catch {}
-  }
+  if (pendingTermFit) return;
+  pendingTermFit = requestAnimationFrame(() => {
+    pendingTermFit = 0;
+    for (const a of state.agents.values()) {
+      if (a.fitAddon) try { a.fitAddon.fit(); } catch {}
+    }
+  });
 });
 function pushLog(kind, text) {
   const list = $('#log-list');

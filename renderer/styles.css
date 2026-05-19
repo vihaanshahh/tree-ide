@@ -1064,6 +1064,20 @@ body.view-agents #agents-grid[data-count="1"] .agent-tile {
   white-space: nowrap;
   text-transform: uppercase;
   color: var(--color-ghost-sand);
+  cursor: text;
+}
+.agent-name:hover { text-decoration: underline dotted; text-underline-offset: 3px; }
+.agent-name-input {
+  background: transparent;
+  border: 1px solid var(--color-ghost-sand);
+  font: inherit;
+  font-family: var(--font-mono);
+  color: var(--color-ghost-sand);
+  text-transform: uppercase;
+  padding: 1px 6px;
+  outline: none;
+  min-width: 80px;
+  max-width: 220px;
 }
 .agent-activity {
   overflow: hidden;
@@ -1508,3 +1522,106 @@ body.view-agents #agents-grid[data-count="1"] .agent-tile {
   border: 1px solid var(--color-ghost-sand-line);
   padding: 10px;
 }
+
+/* ---------- SSH modal + welcome actions ---------- */
+.welcome-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+.modal-content.modal-narrow {
+  max-width: 460px;
+  padding: 36px 36px;
+}
+.modal-content.modal-narrow h2 { font-size: 28px; margin-bottom: 14px; }
+.modal-content.modal-narrow p  { margin-bottom: 22px; }
+.form-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 14px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: var(--tracking-mono);
+  color: var(--color-ghost-sand);
+}
+.form-row span { text-transform: uppercase; color: var(--color-ghost-sand-dim); }
+.form-row em { font-style: normal; text-transform: none; }
+.form-row input {
+  background: transparent;
+  border: 1px solid var(--color-ghost-sand-line);
+  padding: 10px 12px;
+  color: var(--color-ghost-sand);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  outline: none;
+}
+.form-row input:focus { border-color: var(--color-ghost-sand); }
+.ssh-status {
+  margin-top: 4px;
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--color-ghost-sand-line);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--color-ghost-sand);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ssh-status.error  { border-color: #b8554c; color: #e3a097; }
+.ssh-status.info   { border-color: var(--color-ghost-sand-line); }
+.ssh-status.hidden { display: none; }
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+/* ---------- Toast stack (error surface) ---------- */
+#toast-stack {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 3000;
+  pointer-events: none;
+  max-width: 420px;
+}
+.toast {
+  pointer-events: auto;
+  padding: 10px 32px 10px 14px;
+  background: var(--color-midnight-void);
+  border: 1px solid var(--color-ghost-sand-line);
+  border-left-width: 3px;
+  color: var(--color-ghost-sand);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.55;
+  letter-spacing: var(--tracking-mono);
+  position: relative;
+  white-space: pre-wrap;
+  word-break: break-word;
+  transition: opacity 0.24s ease, transform 0.24s ease;
+}
+.toast .toast-close {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  background: transparent;
+  border: none;
+  color: var(--color-ghost-sand-dim);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+}
+.toast .toast-close:hover { color: var(--color-ghost-sand); }
+.toast-error { border-left-color: #c8625a; }
+.toast-warn  { border-left-color: #d8a64c; }
+.toast-info  { border-left-color: var(--color-ghost-sand); }
+.toast-fade  { opacity: 0; transform: translateY(6px); }
