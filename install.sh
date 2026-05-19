@@ -86,17 +86,43 @@ main() {
     fi
   fi
 
-  info "Installing dependencies (this includes a native rebuild of node-pty)..."
-  ( cd "$install_dir" && npm install )
+  # Headless detection — Linux remotes typically have no DISPLAY and no
+  # /Applications, so Electron can't run there. Skip the Electron native
+  # rebuild and install just for serve mode. The user can opt in/out
+  # explicitly via TREE_IDE_SERVER_ONLY=1 / TREE_IDE_SERVER_ONLY=0.
+  if [ -z "${TREE_IDE_SERVER_ONLY:-}" ]; then
+    if [ "$os" = "linux" ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${XDG_SESSION_TYPE:-}" ]; then
+      TREE_IDE_SERVER_ONLY=1
+      info "No display detected — installing in server-only (headless) mode."
+      info "Tree will run as: tree-ide --serve   (reach it over an SSH tunnel)"
+    fi
+  fi
+
+  if [ "${TREE_IDE_SERVER_ONLY:-0}" = "1" ]; then
+    info "Installing dependencies (server-only — skipping Electron rebuild)..."
+    ( cd "$install_dir" && TREE_IDE_SERVER_ONLY=1 npm install )
+  else
+    info "Installing dependencies (this includes a native rebuild of node-pty)..."
+    ( cd "$install_dir" && npm install )
+  fi
 
   install_launcher "$install_dir"
 
   success "Tree IDE installed at $install_dir"
-  printf "\n  Launch with:\n    ${GREEN}%s${NC}\n\n" "${LAUNCH_HINT:-cd $install_dir && npm start}"
+  if [ "${TREE_IDE_SERVER_ONLY:-0}" = "1" ]; then
+    printf "\n  Launch headless server with:\n    ${GREEN}%s${NC}\n" "${LAUNCH_HINT:-tree-ide --serve}"
+    printf "  Then from your laptop:\n    ${GREEN}ssh -L 7878:127.0.0.1:7878 user@$(hostname 2>/dev/null || echo this-host) tree-ide --serve --port 7878${NC}\n"
+    printf "  Open the printed URL in any browser.\n\n"
+  else
+    printf "\n  Launch with:\n    ${GREEN}%s${NC}\n\n" "${LAUNCH_HINT:-cd $install_dir && npm start}"
+  fi
 
-  # Auto-launch unless the user opted out.
+  # Auto-launch unless the user opted out, or we're in server-only mode
+  # (which would block this shell on the foreground server).
   if [ "${TREE_IDE_NO_LAUNCH:-0}" = "1" ]; then
     info "TREE_IDE_NO_LAUNCH=1 set — not launching."
+  elif [ "${TREE_IDE_SERVER_ONLY:-0}" = "1" ]; then
+    info "Not auto-starting in server mode — run the command above when you're ready."
   else
     info "Starting Tree IDE..."
     ( cd "$install_dir" && npm start )
@@ -106,7 +132,8 @@ main() {
 install_launcher() {
   local app_dir="$1"
   local app_bin="$app_dir/bin/tree-ide.js"
-  chmod +x "$app_bin" 2>/dev/null || true
+  local server_bin="$app_dir/bin/tree-ide-server.js"
+  chmod +x "$app_bin" "$server_bin" 2>/dev/null || true
 
   local target_dir=""
   case ":$PATH:" in
@@ -133,7 +160,13 @@ install_launcher() {
 
   $sudo_cmd ln -sf "$app_bin" "$target_dir/tree-ide"
   success "Installed command: tree-ide → $target_dir/tree-ide"
-  LAUNCH_HINT="tree-ide ."
+  $sudo_cmd ln -sf "$server_bin" "$target_dir/tree-ide-server"
+  success "Installed command: tree-ide-server → $target_dir/tree-ide-server"
+  if [ "${TREE_IDE_SERVER_ONLY:-0}" = "1" ]; then
+    LAUNCH_HINT="tree-ide --serve"
+  else
+    LAUNCH_HINT="tree-ide ."
+  fi
 
   # Also expose as `tree` if nothing else owns that name.
   local existing

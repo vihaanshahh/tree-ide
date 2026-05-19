@@ -1,35 +1,32 @@
-// Tree IDE main process.
-//   - Walks any folder into the graph (src/scanner.js).
-//   - Spawns provider CLIs (`claude`, `codex`, or your shell) as PTYs and
-//     streams them to the renderer; renderer mounts each in an xterm.js
-//     pane in the multi-agent grid.
-//   - Watches the open repo for filesystem writes and forwards events so
-//     the canvas can flash the touched nodes — provider-agnostic signal:
-//     if a file changes on disk, the graph reflects it, no matter who
-//     wrote it.
+// Tree IDE — Electron main process.
+//
+// Architecture (post-WebSocket refactor):
+//   - Backend (src/backend.js) holds every operation the renderer can
+//     invoke: scan, file read, PTY, watcher, providers, update check.
+//   - Server (src/server.js) wraps the Backend in HTTP + WebSocket and
+//     binds to 127.0.0.1:0 with a random per-launch token.
+//   - This main process spawns the server in-process, then loads
+//     `http://127.0.0.1:PORT/?token=…` into a BrowserWindow.
+//
+// The desktop UX is unchanged for users. What's new is that the same
+// renderer + same backend can be reached from any browser when running
+// in serve mode (`bin/tree-ide-server.js`) over an SSH tunnel.
 
 const { app, BrowserWindow, ipcMain, dialog, Menu, nativeImage, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const os = require('os');
-const https = require('https');
 const zlib = require('zlib');
+const https = require('https');
 const { spawn } = require('child_process');
-const pty = require('node-pty');
-const chokidar = require('chokidar');
-const { buildGraph } = require('./src/scanner');
+const net = require('net');
+const { Backend, normalizeOpenRoot, compareVersions, fetchLatestRelease } = require('./src/backend');
+const { startServer } = require('./src/server');
 const pkg = require('./package.json');
 
 const UPDATE_REPO = 'vihaanshahh/tree-ide';
 
 // =======================================================================
 // Linux / WSL compatibility switches — must run before app.whenReady().
-//
-// On WSLg, Chromium's GPU init reliably fails and the user-namespace
-// sandbox is often unavailable, so without these switches the window
-// either never paints or never opens at all. We also pin ozone to X11
-// on Linux because Electron 33's Wayland integration is still flaky on
-// many setups (XWayland handles X11 clients fine in either case).
 // =======================================================================
 function isWSL() {
   if (process.platform !== 'linux') return false;
@@ -45,31 +42,22 @@ if (isWSL()) {
   app.commandLine.appendSwitch('no-sandbox');
   app.commandLine.appendSwitch('disable-gpu');
 }
-// Lift the renderer's V8 heap so big repos don't crash the canvas.
 app.commandLine.appendSwitch('js-flags', '--max-old-space-size=4096');
 
 // =======================================================================
-// Build the app icon (the same directory-tree logo used in the titlebar)
-// as a PNG buffer at runtime — no extra deps, no SVG rasterizer needed.
+// Runtime-generated app icon (no SVG rasterizer, no extra deps).
 // =======================================================================
 function buildLogoPng(size = 512) {
   const W = size, H = size;
-  const px = Buffer.alloc(W * H * 4); // RGBA, transparent by default
+  const px = Buffer.alloc(W * H * 4);
   const sand  = [231, 222, 209, 255];
   const black = [0, 0, 0, 255];
-
-  // macOS Big Sur+ icon template: the rounded badge takes ~80% of the canvas
-  // with transparent padding around it (so it sits inset from the dock edges).
-  // Corner radius is ~22.5% of the badge's inner width.
   const pad = Math.round(size * 0.055);
   const inner = size - pad * 2;
-  const scale = inner / 24;            // logical units → badge pixels
-  const r = Math.round(inner * 0.225); // rounded corner radius
-
+  const scale = inner / 24;
+  const r = Math.round(inner * 0.225);
   const x0 = pad, y0 = pad;
   const x1 = pad + inner, y1 = pad + inner;
-
-  // Fill the rounded badge with sand.
   for (let y = y0; y < y1; y++) {
     for (let x = x0; x < x1; x++) {
       let cx = x, cy = y, corner = false;
@@ -79,14 +67,12 @@ function buildLogoPng(size = 512) {
       else if (x >= x1 - r && y >= y1 - r)       { cx = x1 - r; cy = y1 - r; corner = true; }
       if (corner) {
         const dx = x - cx, dy = y - cy;
-        if (dx*dx + dy*dy > r*r) continue; // outside the rounded corner
+        if (dx*dx + dy*dy > r*r) continue;
       }
       const i = (y * W + x) * 4;
       px[i]=sand[0]; px[i+1]=sand[1]; px[i+2]=sand[2]; px[i+3]=255;
     }
   }
-
-  // Carve the tree inside the badge.
   const fillRect = (lx, ly, lw, lh, c) => {
     const px0 = Math.floor(x0 + lx * scale);
     const py0 = Math.floor(y0 + ly * scale);
@@ -95,7 +81,7 @@ function buildLogoPng(size = 512) {
     for (let y = py0; y < py1; y++) {
       for (let x = px0; x < px1; x++) {
         const i = (y * W + x) * 4;
-        if (px[i+3] === 0) continue; // don't paint outside the badge
+        if (px[i+3] === 0) continue;
         px[i]=c[0]; px[i+1]=c[1]; px[i+2]=c[2]; px[i+3]=c[3];
       }
     }
@@ -105,30 +91,25 @@ function buildLogoPng(size = 512) {
   fillRect(10, 11, 3, 3,    black);
   fillRect(17, 11, 3, 3,    black);
   fillRect(17, 17, 3, 3,    black);
-  fillRect(4,  7,  1, 11.5, black); // trunk
-  fillRect(4,  5.5, 6, 1,   black); // → top child
-  fillRect(4,  12.5, 6, 1,  black); // → mid child
-  fillRect(11, 14, 1, 4.5,  black); // sub-trunk
-  fillRect(11, 12.5, 6, 1,  black); // sub child
-  fillRect(11, 18.5, 6, 1,  black); // sub child
-
-  // Build a PNG (signature + IHDR + IDAT + IEND chunks).
+  fillRect(4,  7,  1, 11.5, black);
+  fillRect(4,  5.5, 6, 1,   black);
+  fillRect(4,  12.5, 6, 1,  black);
+  fillRect(11, 14, 1, 4.5,  black);
+  fillRect(11, 12.5, 6, 1,  black);
+  fillRect(11, 18.5, 6, 1,  black);
   const sig = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(W, 0);
   ihdr.writeUInt32BE(H, 4);
-  ihdr[8]  = 8;   // bit depth
-  ihdr[9]  = 6;   // RGBA
+  ihdr[8]  = 8;
+  ihdr[9]  = 6;
   ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
-
-  // raw scanlines: 1 filter byte + W*4 RGBA per row
   const raw = Buffer.alloc(H * (1 + W * 4));
   for (let y = 0; y < H; y++) {
-    raw[y * (1 + W * 4)] = 0; // None filter
+    raw[y * (1 + W * 4)] = 0;
     px.copy(raw, y * (1 + W * 4) + 1, y * W * 4, (y + 1) * W * 4);
   }
   const idat = zlib.deflateSync(raw);
-
   const chunk = (type, data) => {
     const len = Buffer.alloc(4);
     len.writeUInt32BE(data.length, 0);
@@ -153,27 +134,8 @@ function getAppIcon() {
 }
 
 let mainWindow = null;
-let currentRoot = null;
-let fsWatcher = null;
-
-function expandHome(p) {
-  if (!p) return p;
-  if (p === '~') return process.env.HOME || p;
-  if (p.startsWith('~/')) return path.join(process.env.HOME || '', p.slice(2));
-  return p;
-}
-
-function normalizeOpenRoot(p) {
-  if (!p) return null;
-  const full = path.resolve(process.cwd(), expandHome(p));
-  try {
-    if (!fs.existsSync(full)) return null;
-    if (!fs.statSync(full).isDirectory()) return null;
-    return full;
-  } catch {
-    return null;
-  }
-}
+let serverHandle = null;
+let backend = null;
 
 function parseOpenRootArg(argv) {
   const args = (argv || []).slice(1);
@@ -189,8 +151,11 @@ function parseOpenRootArg(argv) {
   return null;
 }
 
-let startupRoot = parseOpenRootArg(process.argv);
-const gotSingleInstanceLock = app.requestSingleInstanceLock();
+const startupRoot = parseOpenRootArg(process.argv);
+// TREE_IDE_DEV=1 lets a second Electron instance run alongside an
+// already-installed copy (e.g. /Applications/Tree.app) — useful when
+// testing local changes without quitting the production app.
+const gotSingleInstanceLock = process.env.TREE_IDE_DEV === '1' || app.requestSingleInstanceLock();
 
 if (!gotSingleInstanceLock) {
   app.quit();
@@ -199,16 +164,221 @@ if (!gotSingleInstanceLock) {
 if (gotSingleInstanceLock) {
   app.on('second-instance', (_event, argv) => {
     const root = parseOpenRootArg(argv);
-    if (root) {
-      startupRoot = root;
-      send('app:open-root', { root });
-    }
+    if (root && backend) backend.setStartupRoot(root);
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore();
       mainWindow.focus();
     }
   });
 }
+
+// =======================================================================
+// Electron hooks — bits of functionality only the desktop shell can do.
+// Wired into Backend so the renderer can invoke them transparently
+// (folder picker, self-update via git pull) over the same WS channel.
+// =======================================================================
+function buildElectronHooks() {
+  return {
+    openFolder: async () => {
+      if (!mainWindow) return null;
+      const result = await dialog.showOpenDialog(mainWindow, {
+        properties: ['openDirectory'],
+        title: 'Open repo to map',
+      });
+      if (result.canceled || !result.filePaths[0]) return null;
+      return result.filePaths[0];
+    },
+
+    checkUpdate: async () => {
+      try {
+        const latest = await fetchLatestRelease(UPDATE_REPO);
+        const current = pkg.version;
+        const isNewer = !!latest.tag && compareVersions(latest.tag, current) > 0;
+        return { current, latest: latest.tag, isNewer, htmlUrl: latest.htmlUrl, gitCheckout: isGitCheckout() };
+      } catch (e) {
+        return { current: pkg.version, error: e.message || String(e) };
+      }
+    },
+
+    relaunch: () => { app.relaunch(); app.exit(0); },
+
+    updateAndRelaunch: async () => {
+      if (!isGitCheckout()) {
+        try { await shell.openExternal(`https://github.com/${UPDATE_REPO}/releases/latest`); } catch {}
+        return { error: 'Not a git checkout — opened the releases page so you can grab the new build.' };
+      }
+      const run = (cmd, args) => new Promise((resolve, reject) => {
+        const child = spawn(cmd, args, { cwd: __dirname, env: process.env });
+        let stderr = '';
+        child.stderr.on('data', (d) => stderr += d.toString());
+        child.on('error', reject);
+        child.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`${cmd} exited ${code}: ${stderr.trim()}`)));
+      });
+      try {
+        backend.events.emit('app:update-progress', { status: 'fetching' });
+        await run('git', ['fetch', '--tags', '--quiet']);
+        backend.events.emit('app:update-progress', { status: 'pulling' });
+        await run('git', ['pull', '--ff-only', '--quiet']);
+        backend.events.emit('app:update-progress', { status: 'installing' });
+        await run('npm', ['install', '--no-audit', '--no-fund', '--silent']);
+        backend.events.emit('app:update-progress', { status: 'relaunching' });
+        app.relaunch();
+        app.exit(0);
+        return { ok: true };
+      } catch (e) {
+        return { error: e.message || String(e) };
+      }
+    },
+  };
+}
+
+function isGitCheckout() {
+  try { return fs.statSync(path.join(__dirname, '.git')).isDirectory() || fs.existsSync(path.join(__dirname, '.git')); }
+  catch { return false; }
+}
+
+// Kept around for the (unlikely) preload-only IPC path. The renderer
+// resolves window.electronNative.pickFolder via this. Server-side it
+// resolves through the Backend hook above; both paths are equivalent.
+ipcMain.handle('dialog:openFolder', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openDirectory'],
+    title: 'Open repo to map',
+  });
+  if (result.canceled || !result.filePaths[0]) return null;
+  return result.filePaths[0];
+});
+
+// =======================================================================
+// Remote / SSH
+//
+// "Connect to SSH" is just `ssh -L LOCAL:127.0.0.1:REMOTE user@host
+// bash -lc 'tree-ide --serve --port REMOTE …'`. We pick a free local
+// port, parse the URL the remote server prints, and navigate the
+// BrowserWindow to it. The tunnel + token check is the whole security
+// boundary, same as the CLI workflow documented in the README.
+// =======================================================================
+let currentSshChild = null;
+let localServerUrl = null; // First URL we ever loaded — used to "Disconnect"
+
+function killCurrentSsh() {
+  if (!currentSshChild) return;
+  const child = currentSshChild;
+  currentSshChild = null;
+  try { child.kill('SIGTERM'); } catch {}
+}
+
+function pickFreePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.unref();
+    srv.on('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const port = srv.address().port;
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
+// POSIX-safe single-quoting for a shell-string passed through ssh.
+const shq = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'";
+
+ipcMain.handle('ssh:connect', async (_e, opts) => {
+  killCurrentSsh();
+  const host       = (opts && opts.host       || '').trim();
+  const remotePath = (opts && opts.path       || '').trim();
+  const identity   = (opts && opts.identity   || '').trim();
+  if (!host) return { error: 'SSH host is required (e.g. user@host).' };
+
+  let port;
+  try { port = await pickFreePort(); }
+  catch (e) { return { error: 'Could not pick a free local port: ' + e.message }; }
+
+  const treeCmd = `tree-ide --serve --host 127.0.0.1 --port ${port}` +
+    (remotePath ? ` ${shq(remotePath)}` : '');
+  const remoteShell = `bash -lc ${shq(treeCmd)}`;
+
+  const sshArgs = [
+    '-o', 'BatchMode=yes',                  // No interactive prompts — key auth only
+    '-o', 'ExitOnForwardFailure=yes',
+    '-o', 'ServerAliveInterval=30',
+    '-o', 'ServerAliveCountMax=4',
+    '-o', 'StrictHostKeyChecking=accept-new',
+    ...(identity ? ['-i', identity] : []),
+    '-L', `127.0.0.1:${port}:127.0.0.1:${port}`,
+    host,
+    remoteShell,
+  ];
+
+  return await new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn('ssh', sshArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (e) {
+      return resolve({ error: 'Failed to spawn ssh: ' + (e.message || e) });
+    }
+    currentSshChild = child;
+
+    let stdout = '', stderr = '';
+    let settled = false;
+    const readyRe = /tree-ide ready:\s*(\S+)/;
+    const timeoutMs = 30000;
+
+    const finishOk = (url) => {
+      if (settled) return;
+      settled = true;
+      resolve({ ok: true, url, port, host });
+    };
+    const finishErr = (msg) => {
+      if (settled) return;
+      settled = true;
+      try { child.kill('SIGTERM'); } catch {}
+      if (currentSshChild === child) currentSshChild = null;
+      resolve({ error: msg });
+    };
+
+    child.stdout.on('data', (buf) => {
+      stdout += buf.toString();
+      const m = readyRe.exec(stdout);
+      if (m) {
+        // Rewrite to local port in case remote chose differently.
+        const url = m[1].replace(/127\.0\.0\.1:\d+/, `127.0.0.1:${port}`);
+        finishOk(url);
+      }
+    });
+    child.stderr.on('data', (buf) => {
+      const text = buf.toString();
+      stderr += text;
+      console.warn('[tree:ssh]', text.trimEnd());
+    });
+    child.on('error', (e) => finishErr('Failed to spawn ssh: ' + (e.message || e)));
+    child.on('exit', (code, sig) => {
+      if (currentSshChild === child) currentSshChild = null;
+      if (!settled) {
+        const tail = (stderr || stdout).trim().split('\n').slice(-4).join('\n').slice(-500);
+        finishErr(`ssh exited (code ${code}${sig ? `, signal ${sig}` : ''}).\n${tail || 'No output.'}`);
+      } else if (mainWindow && !mainWindow.isDestroyed()) {
+        // Tunnel died after we navigated. Tell the renderer so it can toast.
+        try { mainWindow.webContents.send('ssh:gone', { code, sig }); } catch {}
+      }
+    });
+
+    setTimeout(() => finishErr(
+      'Timed out after 30s waiting for tree-ide to start on the remote.\n' +
+      '• Make sure ssh key-auth works (try `ssh ' + host + '` in a terminal).\n' +
+      '• Make sure tree-ide is installed there (`curl -fsSL ' +
+      'https://raw.githubusercontent.com/' + UPDATE_REPO + '/main/install.sh | sh`).'
+    ), timeoutMs);
+  });
+});
+
+ipcMain.handle('ssh:disconnect', async () => {
+  killCurrentSsh();
+  if (mainWindow && localServerUrl) {
+    try { mainWindow.loadURL(localServerUrl); } catch {}
+  }
+  return { ok: true };
+});
 
 // =======================================================================
 // Window
@@ -230,422 +400,55 @@ function createWindow() {
       sandbox: false,
     },
   });
-  mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+
+  // The page is served by our embedded HTTP server. Token is appended
+  // so the page's transport.js can authenticate its WebSocket on load.
+  if (!serverHandle) {
+    console.error('[tree] server handle missing — refusing to open a window.');
+    return;
+  }
+  localServerUrl = `http://127.0.0.1:${serverHandle.port}/?token=${encodeURIComponent(serverHandle.token)}`;
+  mainWindow.loadURL(localServerUrl);
+
+  // Diagnostics: catch renderer death (crashed/killed/oom/launch-failed)
+  // and stalls. Without these, a fullscreen-triggered renderer kill just
+  // looks like a blank window with no trail.
+  mainWindow.webContents.on('render-process-gone', (_e, details) => {
+    console.error('[tree] renderer gone:', details && details.reason, 'exitCode:', details && details.exitCode);
+  });
+  mainWindow.webContents.on('unresponsive', () => {
+    console.warn('[tree] renderer unresponsive');
+  });
+  mainWindow.webContents.on('responsive', () => {
+    console.log('[tree] renderer responsive again');
+  });
+
   if (process.argv.includes('--devtools') || process.env.TREE_DEVTOOLS === '1') {
     mainWindow.webContents.openDevTools({ mode: 'detach' });
   }
 }
 
-function send(channel, payload) {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send(channel, payload);
-  }
-}
-
 // =======================================================================
-// CLI discovery — provider lookup with sensible PATH fallbacks
+// Boot — start backend + server before opening any window so the
+// renderer never sees a half-initialized state.
 // =======================================================================
-function searchPathFor(bin) {
-  const home = process.env.HOME || '';
-  const candidates = [
-    `${home}/.local/bin/${bin}`,
-    `${home}/.npm-global/bin/${bin}`,
-    `${home}/.claude/local/${bin}`,
-    `${home}/.claude/bin/${bin}`,
-    `/opt/homebrew/bin/${bin}`,
-    `/usr/local/bin/${bin}`,
-    `/usr/bin/${bin}`,
-  ];
-  for (const c of candidates) if (fs.existsSync(c)) return c;
-  try {
-    const { execSync } = require('child_process');
-    const out = execSync(`command -v ${bin}`, {
-      shell: '/bin/zsh',
-      env: { ...process.env, PATH: candidates.map(c => path.dirname(c)).join(':') + ':' + (process.env.PATH || '') },
-    }).toString().trim();
-    if (out && fs.existsSync(out)) return out;
-  } catch {}
-  return null;
-}
-
-function detectProviders() {
-  return {
-    claude: searchPathFor('claude'),
-    codex:  searchPathFor('codex'),
-    shell:  process.env.SHELL || '/bin/zsh',
-  };
-}
-
-ipcMain.handle('providers:detect', async () => detectProviders());
-ipcMain.handle('app:startup-root', async () => startupRoot);
-
-// =======================================================================
-// Update check — polls GitHub releases for a newer tag than package.json.
-// Surfaces in the titlebar so the user can pull + relaunch without leaving
-// the app when their checkout is behind.
-// =======================================================================
-function compareVersions(a, b) {
-  const split = (v) => String(v || '').replace(/^v/, '').split(/[.-]/).map(s => /^\d+$/.test(s) ? parseInt(s, 10) : s);
-  const pa = split(a), pb = split(b);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const x = pa[i] ?? 0, y = pb[i] ?? 0;
-    if (typeof x === 'number' && typeof y === 'number') {
-      if (x !== y) return x - y;
-    } else if (String(x) !== String(y)) {
-      return String(x) < String(y) ? -1 : 1;
-    }
-  }
-  return 0;
-}
-
-function fetchLatestRelease() {
-  return new Promise((resolve, reject) => {
-    const req = https.get(
-      `https://api.github.com/repos/${UPDATE_REPO}/releases/latest`,
-      { headers: { 'User-Agent': 'tree-ide-update-check', 'Accept': 'application/vnd.github+json' } },
-      (res) => {
-        if (res.statusCode !== 200) {
-          res.resume();
-          return reject(new Error(`HTTP ${res.statusCode}`));
-        }
-        let body = '';
-        res.on('data', (c) => body += c);
-        res.on('end', () => {
-          try {
-            const j = JSON.parse(body);
-            resolve({
-              tag: String(j.tag_name || '').replace(/^v/, ''),
-              htmlUrl: j.html_url || `https://github.com/${UPDATE_REPO}/releases`,
-            });
-          } catch (e) { reject(e); }
-        });
-      }
-    );
-    req.setTimeout(8000, () => req.destroy(new Error('timeout')));
-    req.on('error', reject);
+async function boot() {
+  backend = new Backend({
+    startupRoot,
+    pkg,
+    updateRepo: UPDATE_REPO,
+    electronHooks: buildElectronHooks(),
   });
+  serverHandle = await startServer({ backend, host: '127.0.0.1', port: 0 });
+  console.log(`[tree] embedded server: ${serverHandle.url}`);
 }
 
-function isGitCheckout() {
-  try { return fs.statSync(path.join(__dirname, '.git')).isDirectory() || fs.existsSync(path.join(__dirname, '.git')); }
-  catch { return false; }
-}
-
-ipcMain.handle('app:check-update', async () => {
-  try {
-    const latest = await fetchLatestRelease();
-    const current = pkg.version;
-    const isNewer = !!latest.tag && compareVersions(latest.tag, current) > 0;
-    return { current, latest: latest.tag, isNewer, htmlUrl: latest.htmlUrl, gitCheckout: isGitCheckout() };
-  } catch (e) {
-    return { current: pkg.version, error: e.message || String(e) };
-  }
-});
-
-ipcMain.handle('app:relaunch', async () => {
-  app.relaunch();
-  app.exit(0);
-  return { ok: true };
-});
-
-ipcMain.handle('app:update-and-relaunch', async () => {
-  if (!isGitCheckout()) {
-    try { await shell.openExternal(`https://github.com/${UPDATE_REPO}/releases/latest`); } catch {}
-    return { error: 'Not a git checkout — opened the releases page so you can grab the new build.' };
-  }
-  const run = (cmd, args) => new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { cwd: __dirname, env: process.env });
-    let stderr = '';
-    child.stderr.on('data', (d) => stderr += d.toString());
-    child.on('error', reject);
-    child.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`${cmd} exited ${code}: ${stderr.trim()}`)));
-  });
-  try {
-    send('app:update-progress', { status: 'fetching' });
-    await run('git', ['fetch', '--tags', '--quiet']);
-    send('app:update-progress', { status: 'pulling' });
-    await run('git', ['pull', '--ff-only', '--quiet']);
-    send('app:update-progress', { status: 'installing' });
-    await run('npm', ['install', '--no-audit', '--no-fund', '--silent']);
-    send('app:update-progress', { status: 'relaunching' });
-    app.relaunch();
-    app.exit(0);
-    return { ok: true };
-  } catch (e) {
-    return { error: e.message || String(e) };
-  }
-});
-
-// =======================================================================
-// Folder open + repo scan
-// =======================================================================
-ipcMain.handle('dialog:openFolder', async () => {
-  const result = await dialog.showOpenDialog(mainWindow, {
-    properties: ['openDirectory'],
-    title: 'Open repo to map',
-  });
-  if (result.canceled || !result.filePaths[0]) return null;
-  return result.filePaths[0];
-});
-
-function isTooBroad(p) {
-  const norm = path.resolve(p);
-  const home = os.homedir();
-  if (norm === '/' || norm === home) return true;
-  // Common "containers of repos" — opening one walks every project at once.
-  const broad = new Set(['/home', '/Users', '/mnt', '/mnt/c', '/mnt/d', '/root', '/tmp']);
-  if (broad.has(norm)) return true;
-  return false;
-}
-
-ipcMain.handle('repo:scan', async (_evt, rootPath) => {
-  if (!rootPath || !fs.existsSync(rootPath)) return { error: 'Path does not exist' };
-  if (isTooBroad(rootPath)) {
-    return { error: `${rootPath} is too broad — open a single project folder instead.` };
-  }
-  currentRoot = rootPath;
-  send('repo:scan-progress', { status: 'scanning', root: rootPath });
-  try {
-    const graph = await buildGraph(rootPath, {
-      concurrency: 64,
-      includeFnEdges: false,
-      onProgress: (done, total) => {
-        if (done === total || done % 50 === 0) {
-          send('repo:scan-progress', { status: 'reading', done, total });
-        }
-      },
-    });
-    send('repo:scan-progress', { status: 'done', count: graph.fileCount, ms: graph.elapsedMs });
-    startFsWatcher(rootPath);
-    return graph;
-  } catch (e) {
-    return { error: e.message };
-  }
-});
-
-ipcMain.handle('file:read', async (_evt, relPath) => {
-  if (!currentRoot) return { error: 'No repo loaded' };
-  const full = path.join(currentRoot, relPath);
-  if (!full.startsWith(currentRoot)) return { error: 'Path escapes root' };
-  try {
-    const content = fs.readFileSync(full, 'utf8');
-    return { content: content.length > 200_000 ? content.slice(0, 200_000) : content };
-  } catch (e) {
-    return { error: e.message };
-  }
-});
-
-// =======================================================================
-// Filesystem watcher — drives the live graph animation
-// =======================================================================
-const FS_SKIP = [
-  '**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**',
-  '**/.next/**', '**/.nuxt/**', '**/.expo/**', '**/.cache/**',
-  '**/.turbo/**', '**/.vercel/**', '**/.parcel-cache/**',
-  '**/.svelte-kit/**', '**/.angular/**', '**/.docusaurus/**',
-  '**/target/**', '**/out/**', '**/vendor/**', '**/.gradle/**',
-  '**/Pods/**', '**/DerivedData/**', '**/.terraform/**', '**/cdk.out/**',
-  '**/.output/**', '**/bower_components/**',
-  '**/__pycache__/**', '**/venv/**', '**/.venv*/**', '**/coverage/**',
-  '**/tmp/**', '**/temp/**', '**/.tmp/**', '**/uploads/**',
-  '**/.DS_Store', '**/Thumbs.db',
-];
-
-function startFsWatcher(root) {
-  if (fsWatcher) {
-    try { fsWatcher.close(); } catch {}
-    fsWatcher = null;
-  }
-  try {
-    fsWatcher = chokidar.watch(root, {
-      ignored: FS_SKIP,
-      ignoreInitial: true,
-      persistent: true,
-      awaitWriteFinish: { stabilityThreshold: 120, pollInterval: 100 },
-    });
-    const emit = (type) => (full) => {
-      const rel = path.relative(root, full);
-      if (!rel || rel.startsWith('..')) return;
-      send('fs:event', { type, path: rel, fullPath: full, at: Date.now() });
-    };
-    fsWatcher.on('add',    emit('add'));
-    fsWatcher.on('change', emit('change'));
-    fsWatcher.on('unlink', emit('unlink'));
-  } catch (e) {
-    send('fs:event', { type: 'error', error: e.message });
-  }
-}
-
-ipcMain.handle('fs:watch', async (_evt, root) => {
-  startFsWatcher(root || currentRoot);
-  return { ok: true };
-});
-
-// =======================================================================
-// Embedded PTY agents (node-pty) — for shell + codex tiles
-// =======================================================================
-const ptyAgents = new Map();
-
-ipcMain.handle('pty:spawn', async (_evt, payload) => {
-  const { agentId, provider = 'shell', cwd: cwdOpt, cols = 100, rows = 32, cliPath: cliOverride } = payload || {};
-  if (!agentId) return { error: 'agentId required' };
-  if (ptyAgents.has(agentId)) return { error: 'agent exists' };
-
-  const providers = detectProviders();
-  let program, args;
-  if (provider === 'claude') {
-    program = cliOverride || providers.claude;
-    if (!program) return { error: 'claude CLI not found. Install: npm i -g @anthropic-ai/claude-code' };
-    args = [];
-  } else if (provider === 'codex') {
-    program = cliOverride || providers.codex;
-    if (!program) return { error: 'codex CLI not found. Install: npm i -g @openai/codex' };
-    args = [];
-  } else {
-    program = process.env.SHELL || '/bin/zsh';
-    args = ['-l'];
-  }
-
-  const cwd = cwdOpt || currentRoot || process.env.HOME || process.cwd();
-
-  const env = { ...process.env };
-  if (provider === 'claude') {
-    delete env.ANTHROPIC_API_KEY;
-    delete env.ANTHROPIC_AUTH_TOKEN;
-  }
-  env.PATH = [
-    `${process.env.HOME}/.local/bin`,
-    `${process.env.HOME}/.npm-global/bin`,
-    `${process.env.HOME}/.claude/local`,
-    '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin',
-    env.PATH || '',
-  ].filter(Boolean).join(':');
-  env.TERM = 'xterm-256color';
-  env.COLORTERM = 'truecolor';
-  env.FORCE_COLOR = env.FORCE_COLOR || '1';
-  env.LANG = env.LANG || 'en_US.UTF-8';
-  env.LC_ALL = env.LC_ALL || env.LANG;
-  env.CI = '';
-
-  let term;
-  try {
-    term = pty.spawn(program, args, { name: 'xterm-256color', cols, rows, cwd, env });
-  } catch (e) {
-    return { error: `Failed to spawn ${provider}: ${e.message}` };
-  }
-
-  ptyAgents.set(agentId, { term, provider, cwd, program });
-  term.onData((data) => send('pty:data', { agentId, data }));
-  term.onExit(({ exitCode, signal }) => {
-    ptyAgents.delete(agentId);
-    send('pty:exit', { agentId, exitCode, signal });
-  });
-  return { ok: true, provider, program, cwd, pid: term.pid };
-});
-
-// Fire-and-forget channels for hot paths — no IPC ack per keystroke.
-ipcMain.on('pty:write', (_evt, { agentId, data }) => {
-  const r = ptyAgents.get(agentId);
-  if (!r) return;
-  try { r.term.write(data); } catch {}
-});
-ipcMain.on('pty:resize', (_evt, { agentId, cols, rows }) => {
-  const r = ptyAgents.get(agentId);
-  if (!r) return;
-  try { r.term.resize(Math.max(2, cols|0), Math.max(2, rows|0)); } catch {}
-});
-ipcMain.handle('pty:kill', async (_evt, agentId) => {
-  const r = ptyAgents.get(agentId);
-  if (!r) return { error: 'no such agent' };
-  try { r.term.kill(); } catch {}
-  ptyAgents.delete(agentId);
-  return { ok: true };
-});
-
-// =======================================================================
-// External terminal launcher — fallback for CLIs whose TUIs don't play
-// nicely inside an embedded PTY (e.g. claude). Opens Terminal.app / iTerm.
-// =======================================================================
-function shellQuote(s) {
-  return `'${String(s).replace(/'/g, `'\\''`)}'`;
-}
-
-function buildLaunchCommand(provider, cwd) {
-  const cmds = ['shell'].includes(provider)
-    ? [`cd ${shellQuote(cwd)}`]
-    : [`cd ${shellQuote(cwd)}`, provider];
-  return cmds.join(' && ');
-}
-
-async function openInTerminalApp(cmd) {
-  if (process.platform === 'darwin') {
-    // Prefer iTerm if installed, else Terminal.app
-    const iterm = '/Applications/iTerm.app';
-    const useITerm = fs.existsSync(iterm);
-    const app = useITerm ? 'iTerm' : 'Terminal';
-    const escaped = cmd.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-    const script = useITerm
-      ? `tell application "iTerm"
-           create window with default profile
-           tell current session of current window to write text "${escaped}"
-           activate
-         end tell`
-      : `tell application "Terminal"
-           do script "${escaped}"
-           activate
-         end tell`;
-    return new Promise((resolve) => {
-      const p = spawn('osascript', ['-e', script], { stdio: 'ignore' });
-      p.on('exit', (code) => resolve({ ok: code === 0, app }));
-      p.on('error', (err) => resolve({ ok: false, error: err.message }));
-    });
-  }
-  if (process.platform === 'linux') {
-    // gnome-terminal as a sensible default
-    return new Promise((resolve) => {
-      const p = spawn('x-terminal-emulator', ['-e', 'bash', '-lc', cmd], { stdio: 'ignore' });
-      p.on('exit', (code) => resolve({ ok: code === 0 }));
-      p.on('error', (err) => resolve({ ok: false, error: err.message }));
-    });
-  }
-  if (process.platform === 'win32') {
-    // Windows Terminal if present, fall back to cmd
-    return new Promise((resolve) => {
-      const p = spawn('wt.exe', ['-d', process.env.USERPROFILE, 'cmd', '/k', cmd], { stdio: 'ignore' });
-      p.on('exit', (code) => resolve({ ok: code === 0 }));
-      p.on('error', () => {
-        const p2 = spawn('cmd.exe', ['/c', 'start', 'cmd', '/k', cmd], { stdio: 'ignore' });
-        p2.on('exit', (c) => resolve({ ok: c === 0 }));
-        p2.on('error', (err) => resolve({ ok: false, error: err.message }));
-      });
-    });
-  }
-  return { ok: false, error: `Unsupported platform: ${process.platform}` };
-}
-
-ipcMain.handle('agent:launch', async (_evt, payload) => {
-  const { provider = 'shell', cwd: cwdOpt } = payload || {};
-  const cwd = cwdOpt || currentRoot || process.env.HOME || process.cwd();
-  const providers = detectProviders();
-  if (provider === 'claude' && !providers.claude)
-    return { error: 'claude CLI not found. Install: npm i -g @anthropic-ai/claude-code' };
-  if (provider === 'codex' && !providers.codex)
-    return { error: 'codex CLI not found. Install: npm i -g @openai/codex' };
-  const cmd = buildLaunchCommand(provider, cwd);
-  const r = await openInTerminalApp(cmd);
-  return { ...r, provider, cwd, cmd };
-});
-
-// =======================================================================
-// App lifecycle
-// =======================================================================
-if (gotSingleInstanceLock) app.whenReady().then(() => {
-  // Brand the app as "Tree" in macOS menubar / About dialog / dock tooltip,
-  // while keeping the long form "Tree IDE" in the package metadata.
+if (gotSingleInstanceLock) app.whenReady().then(async () => {
   try { app.setName('Tree'); } catch {}
   if (process.platform === 'darwin' && app.dock) {
     try { app.dock.setIcon(getAppIcon()); } catch {}
   }
+  await boot();
   createWindow();
   const isMac = process.platform === 'darwin';
   const template = [
@@ -653,7 +456,18 @@ if (gotSingleInstanceLock) app.whenReady().then(() => {
     {
       label: 'File',
       submenu: [
-        { label: 'Open Repo…', accelerator: 'CmdOrCtrl+O', click: () => send('menu:open-folder') },
+        { label: 'Open Repo…', accelerator: 'CmdOrCtrl+O', click: () => {
+          if (backend) backend.events.emit('menu:open-folder', {});
+        } },
+        { label: 'Connect Remote…', accelerator: 'CmdOrCtrl+Shift+R', click: () => {
+          if (backend) backend.events.emit('menu:open-ssh', {});
+        } },
+        { label: 'Disconnect Remote', click: () => {
+          killCurrentSsh();
+          if (mainWindow && localServerUrl) {
+            try { mainWindow.loadURL(localServerUrl); } catch {}
+          }
+        } },
         { type: 'separator' },
         isMac ? { role: 'close' } : { role: 'quit' },
       ],
@@ -672,12 +486,14 @@ if (gotSingleInstanceLock) app.whenReady().then(() => {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 });
 
-app.on('window-all-closed', () => {
-  for (const [, r] of ptyAgents) { try { r.term.kill(); } catch {} }
-  ptyAgents.clear();
-  if (fsWatcher) { try { fsWatcher.close(); } catch {} fsWatcher = null; }
+app.on('window-all-closed', async () => {
+  killCurrentSsh();
+  if (backend) try { backend.shutdown(); } catch {}
+  if (serverHandle) try { await serverHandle.close(); } catch {}
   if (process.platform !== 'darwin') app.quit();
 });
+
+app.on('before-quit', killCurrentSsh);
 
 app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) createWindow();

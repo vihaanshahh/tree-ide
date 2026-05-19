@@ -1,0 +1,455 @@
+// Tree IDE backend — provider-agnostic core extracted from main.js.
+//
+// Everything the renderer needs (scan, file read, PTY, watcher, provider
+// detection, external terminal launch, update check) lives here as plain
+// functions on a Backend instance. The same instance is used both by:
+//
+//   - main.js (Electron desktop mode): wraps Backend with HTTP+WS server,
+//     then loads http://127.0.0.1:PORT/ in BrowserWindow.
+//   - bin/tree-ide-server.js (headless serve mode): runs the same server
+//     on a remote host, user SSH-tunnels in and opens a browser.
+//
+// Events fire on backend.events (an EventEmitter). The HTTP+WS server
+// forwards them to every connected client.
+
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const https = require('https');
+const { EventEmitter } = require('events');
+const { spawn, execSync } = require('child_process');
+const chokidar = require('chokidar');
+const { buildGraph } = require('./scanner');
+
+const FS_SKIP = [
+  '**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**',
+  '**/.next/**', '**/.nuxt/**', '**/.expo/**', '**/.cache/**',
+  '**/.turbo/**', '**/.vercel/**', '**/.parcel-cache/**',
+  '**/.svelte-kit/**', '**/.angular/**', '**/.docusaurus/**',
+  '**/target/**', '**/out/**', '**/vendor/**', '**/.gradle/**',
+  '**/Pods/**', '**/DerivedData/**', '**/.terraform/**', '**/cdk.out/**',
+  '**/.output/**', '**/bower_components/**',
+  '**/__pycache__/**', '**/venv/**', '**/.venv*/**', '**/coverage/**',
+  '**/tmp/**', '**/temp/**', '**/.tmp/**', '**/uploads/**',
+  '**/.DS_Store', '**/Thumbs.db',
+];
+
+function expandHome(p) {
+  if (!p) return p;
+  if (p === '~') return process.env.HOME || p;
+  if (p.startsWith('~/')) return path.join(process.env.HOME || '', p.slice(2));
+  return p;
+}
+
+function normalizeOpenRoot(p) {
+  if (!p) return null;
+  const full = path.resolve(process.cwd(), expandHome(p));
+  try {
+    if (!fs.existsSync(full)) return null;
+    if (!fs.statSync(full).isDirectory()) return null;
+    return full;
+  } catch {
+    return null;
+  }
+}
+
+function isTooBroad(p) {
+  const norm = path.resolve(p);
+  const home = os.homedir();
+  if (norm === '/' || norm === home) return true;
+  const broad = new Set(['/home', '/Users', '/mnt', '/mnt/c', '/mnt/d', '/root', '/tmp']);
+  if (broad.has(norm)) return true;
+  return false;
+}
+
+// node-pty is loaded lazily so the server can survive on remotes where the
+// native build failed (file reads + scan still work; only PTY breaks).
+function loadPty() {
+  try {
+    return require('node-pty');
+  } catch (e) {
+    return { _error: e };
+  }
+}
+
+function searchPathFor(bin) {
+  const home = process.env.HOME || '';
+  const candidates = [
+    `${home}/.local/bin/${bin}`,
+    `${home}/.npm-global/bin/${bin}`,
+    `${home}/.claude/local/${bin}`,
+    `${home}/.claude/bin/${bin}`,
+    `/opt/homebrew/bin/${bin}`,
+    `/usr/local/bin/${bin}`,
+    `/usr/bin/${bin}`,
+  ];
+  for (const c of candidates) if (fs.existsSync(c)) return c;
+  try {
+    const out = execSync(`command -v ${bin}`, {
+      shell: '/bin/zsh',
+      env: { ...process.env, PATH: candidates.map(c => path.dirname(c)).join(':') + ':' + (process.env.PATH || '') },
+    }).toString().trim();
+    if (out && fs.existsSync(out)) return out;
+  } catch {}
+  return null;
+}
+
+function shellQuote(s) {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+class Backend {
+  constructor(opts = {}) {
+    this.events = new EventEmitter();
+    // Bump the listener cap — each connected WS client subscribes to every
+    // event channel; with multiple browser tabs open the default 10 limit
+    // would fire noisy warnings even though there's no leak.
+    this.events.setMaxListeners(0);
+    this.startupRoot = opts.startupRoot || null;
+    this.currentRoot = null;
+    this.fsWatcher = null;
+    this.ptyAgents = new Map();
+    // Set by main.js when running inside Electron; lets us still expose
+    // app-level features (folder picker, relaunch) over the RPC channel
+    // when the host process can implement them.
+    this.electronHooks = opts.electronHooks || null;
+    this.pkg = opts.pkg || { version: '0.0.0' };
+    this.updateRepo = opts.updateRepo || 'vihaanshahh/tree-ide';
+  }
+
+  // -------------------------------------------------------------------
+  // Repo scan + file read
+  // -------------------------------------------------------------------
+  async scanRepo(rootPath) {
+    if (!rootPath || !fs.existsSync(rootPath)) return { error: 'Path does not exist' };
+    if (isTooBroad(rootPath)) {
+      return { error: `${rootPath} is too broad — open a single project folder instead.` };
+    }
+    this.currentRoot = rootPath;
+    this.events.emit('repo:scan-progress', { status: 'scanning', root: rootPath });
+    try {
+      const graph = await buildGraph(rootPath, {
+        concurrency: 64,
+        includeFnEdges: false,
+        onProgress: (done, total) => {
+          if (done === total || done % 50 === 0) {
+            this.events.emit('repo:scan-progress', { status: 'reading', done, total });
+          }
+        },
+      });
+      this.events.emit('repo:scan-progress', { status: 'done', count: graph.fileCount, ms: graph.elapsedMs });
+      this.startFsWatcher(rootPath);
+      return graph;
+    } catch (e) {
+      return { error: e.message };
+    }
+  }
+
+  async readFile(relPath) {
+    if (!this.currentRoot) return { error: 'No repo loaded' };
+    const full = path.join(this.currentRoot, relPath);
+    if (!full.startsWith(this.currentRoot)) return { error: 'Path escapes root' };
+    try {
+      const content = fs.readFileSync(full, 'utf8');
+      return { content: content.length > 200_000 ? content.slice(0, 200_000) : content };
+    } catch (e) {
+      return { error: e.message };
+    }
+  }
+
+  detectProviders() {
+    return {
+      claude: searchPathFor('claude'),
+      codex:  searchPathFor('codex'),
+      shell:  process.env.SHELL || '/bin/zsh',
+    };
+  }
+
+  getStartupRoot() {
+    return this.startupRoot;
+  }
+
+  setStartupRoot(root) {
+    this.startupRoot = normalizeOpenRoot(root);
+    if (this.startupRoot) this.events.emit('app:open-root', { root: this.startupRoot });
+  }
+
+  // -------------------------------------------------------------------
+  // FS watcher
+  // -------------------------------------------------------------------
+  startFsWatcher(root) {
+    if (this.fsWatcher) {
+      try { this.fsWatcher.close(); } catch {}
+      this.fsWatcher = null;
+    }
+    try {
+      this.fsWatcher = chokidar.watch(root, {
+        ignored: FS_SKIP,
+        ignoreInitial: true,
+        persistent: true,
+        awaitWriteFinish: { stabilityThreshold: 120, pollInterval: 100 },
+      });
+      const emit = (type) => (full) => {
+        const rel = path.relative(root, full);
+        if (!rel || rel.startsWith('..')) return;
+        this.events.emit('fs:event', { type, path: rel, fullPath: full, at: Date.now() });
+      };
+      this.fsWatcher.on('add',    emit('add'));
+      this.fsWatcher.on('change', emit('change'));
+      this.fsWatcher.on('unlink', emit('unlink'));
+    } catch (e) {
+      this.events.emit('fs:event', { type: 'error', error: e.message });
+    }
+  }
+
+  watchFs(root) {
+    this.startFsWatcher(root || this.currentRoot);
+    return { ok: true };
+  }
+
+  // -------------------------------------------------------------------
+  // PTY agents
+  // -------------------------------------------------------------------
+  ptySpawn(payload) {
+    const { agentId, provider = 'shell', cwd: cwdOpt, cols = 100, rows = 32, cliPath: cliOverride } = payload || {};
+    if (!agentId) return { error: 'agentId required' };
+    if (this.ptyAgents.has(agentId)) return { error: 'agent exists' };
+
+    const pty = loadPty();
+    if (pty._error) return { error: `node-pty unavailable: ${pty._error.message}` };
+
+    const providers = this.detectProviders();
+    let program, args;
+    if (provider === 'claude') {
+      program = cliOverride || providers.claude;
+      if (!program) return { error: 'claude CLI not found. Install: npm i -g @anthropic-ai/claude-code' };
+      args = [];
+    } else if (provider === 'codex') {
+      program = cliOverride || providers.codex;
+      if (!program) return { error: 'codex CLI not found. Install: npm i -g @openai/codex' };
+      args = [];
+    } else {
+      program = process.env.SHELL || '/bin/zsh';
+      args = ['-l'];
+    }
+
+    const cwd = cwdOpt || this.currentRoot || process.env.HOME || process.cwd();
+
+    const env = { ...process.env };
+    if (provider === 'claude') {
+      delete env.ANTHROPIC_API_KEY;
+      delete env.ANTHROPIC_AUTH_TOKEN;
+    }
+    env.PATH = [
+      `${process.env.HOME}/.local/bin`,
+      `${process.env.HOME}/.npm-global/bin`,
+      `${process.env.HOME}/.claude/local`,
+      '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin',
+      env.PATH || '',
+    ].filter(Boolean).join(':');
+    env.TERM = 'xterm-256color';
+    env.COLORTERM = 'truecolor';
+    env.FORCE_COLOR = env.FORCE_COLOR || '1';
+    env.LANG = env.LANG || 'en_US.UTF-8';
+    env.LC_ALL = env.LC_ALL || env.LANG;
+    env.CI = '';
+
+    let term;
+    try {
+      term = pty.spawn(program, args, { name: 'xterm-256color', cols, rows, cwd, env });
+    } catch (e) {
+      return { error: `Failed to spawn ${provider}: ${e.message}` };
+    }
+
+    this.ptyAgents.set(agentId, { term, provider, cwd, program });
+    term.onData((data) => this.events.emit('pty:data', { agentId, data }));
+    term.onExit(({ exitCode, signal }) => {
+      this.ptyAgents.delete(agentId);
+      this.events.emit('pty:exit', { agentId, exitCode, signal });
+    });
+    return { ok: true, provider, program, cwd, pid: term.pid };
+  }
+
+  ptyWrite(agentId, data) {
+    const r = this.ptyAgents.get(agentId);
+    if (!r) return;
+    try { r.term.write(data); } catch {}
+  }
+
+  ptyResize(agentId, cols, rows) {
+    const r = this.ptyAgents.get(agentId);
+    if (!r) return;
+    try { r.term.resize(Math.max(2, cols|0), Math.max(2, rows|0)); } catch {}
+  }
+
+  ptyKill(agentId) {
+    const r = this.ptyAgents.get(agentId);
+    if (!r) return { error: 'no such agent' };
+    try { r.term.kill(); } catch {}
+    this.ptyAgents.delete(agentId);
+    return { ok: true };
+  }
+
+  // -------------------------------------------------------------------
+  // External terminal launcher — fallback for TUIs that don't render
+  // nicely inside an embedded PTY. Skipped in headless serve mode (no
+  // local desktop session to pop a window into).
+  // -------------------------------------------------------------------
+  async launchAgent(payload) {
+    const { provider = 'shell', cwd: cwdOpt } = payload || {};
+    const cwd = cwdOpt || this.currentRoot || process.env.HOME || process.cwd();
+    const providers = this.detectProviders();
+    if (provider === 'claude' && !providers.claude)
+      return { error: 'claude CLI not found. Install: npm i -g @anthropic-ai/claude-code' };
+    if (provider === 'codex' && !providers.codex)
+      return { error: 'codex CLI not found. Install: npm i -g @openai/codex' };
+    const cmds = provider === 'shell'
+      ? [`cd ${shellQuote(cwd)}`]
+      : [`cd ${shellQuote(cwd)}`, provider];
+    const cmd = cmds.join(' && ');
+
+    if (process.env.TREE_IDE_HEADLESS === '1') {
+      return { error: 'External terminal launch not available in headless serve mode.' };
+    }
+
+    if (process.platform === 'darwin') {
+      const iterm = '/Applications/iTerm.app';
+      const useITerm = fs.existsSync(iterm);
+      const app = useITerm ? 'iTerm' : 'Terminal';
+      const escaped = cmd.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      const script = useITerm
+        ? `tell application "iTerm"
+             create window with default profile
+             tell current session of current window to write text "${escaped}"
+             activate
+           end tell`
+        : `tell application "Terminal"
+             do script "${escaped}"
+             activate
+           end tell`;
+      return new Promise((resolve) => {
+        const p = spawn('osascript', ['-e', script], { stdio: 'ignore' });
+        p.on('exit', (code) => resolve({ ok: code === 0, app, provider, cwd, cmd }));
+        p.on('error', (err) => resolve({ ok: false, error: err.message, provider, cwd, cmd }));
+      });
+    }
+    if (process.platform === 'linux') {
+      return new Promise((resolve) => {
+        const p = spawn('x-terminal-emulator', ['-e', 'bash', '-lc', cmd], { stdio: 'ignore' });
+        p.on('exit', (code) => resolve({ ok: code === 0, provider, cwd, cmd }));
+        p.on('error', (err) => resolve({ ok: false, error: err.message, provider, cwd, cmd }));
+      });
+    }
+    if (process.platform === 'win32') {
+      return new Promise((resolve) => {
+        const p = spawn('wt.exe', ['-d', process.env.USERPROFILE, 'cmd', '/k', cmd], { stdio: 'ignore' });
+        p.on('exit', (code) => resolve({ ok: code === 0, provider, cwd, cmd }));
+        p.on('error', () => {
+          const p2 = spawn('cmd.exe', ['/c', 'start', 'cmd', '/k', cmd], { stdio: 'ignore' });
+          p2.on('exit', (c) => resolve({ ok: c === 0, provider, cwd, cmd }));
+          p2.on('error', (err) => resolve({ ok: false, error: err.message, provider, cwd, cmd }));
+        });
+      });
+    }
+    return { ok: false, error: `Unsupported platform: ${process.platform}`, provider, cwd, cmd };
+  }
+
+  // -------------------------------------------------------------------
+  // Update check — Electron-only. In serve mode these become no-ops so
+  // the renderer just hides the update banner.
+  // -------------------------------------------------------------------
+  async checkUpdate() {
+    if (this.electronHooks?.checkUpdate) {
+      try { return await this.electronHooks.checkUpdate(); }
+      catch (e) { return { current: this.pkg.version, error: e.message || String(e) }; }
+    }
+    try {
+      const latest = await fetchLatestRelease(this.updateRepo);
+      const current = this.pkg.version;
+      const isNewer = !!latest.tag && compareVersions(latest.tag, current) > 0;
+      return { current, latest: latest.tag, isNewer, htmlUrl: latest.htmlUrl, gitCheckout: false, serveMode: true };
+    } catch (e) {
+      return { current: this.pkg.version, error: e.message || String(e) };
+    }
+  }
+
+  async relaunchApp() {
+    if (this.electronHooks?.relaunch) {
+      this.electronHooks.relaunch();
+      return { ok: true };
+    }
+    return { error: 'Relaunch only available in desktop mode.' };
+  }
+
+  async updateAndRelaunch() {
+    if (this.electronHooks?.updateAndRelaunch) {
+      return this.electronHooks.updateAndRelaunch();
+    }
+    return { error: 'Self-update only available in desktop mode. Re-run install.sh on this host to upgrade.' };
+  }
+
+  // -------------------------------------------------------------------
+  // Folder picker — Electron-only. In browser mode the renderer falls
+  // back to a path input.
+  // -------------------------------------------------------------------
+  async openFolder() {
+    if (this.electronHooks?.openFolder) return this.electronHooks.openFolder();
+    return null;
+  }
+
+  // -------------------------------------------------------------------
+  // Lifecycle
+  // -------------------------------------------------------------------
+  shutdown() {
+    for (const [, r] of this.ptyAgents) { try { r.term.kill(); } catch {} }
+    this.ptyAgents.clear();
+    if (this.fsWatcher) {
+      try { this.fsWatcher.close(); } catch {}
+      this.fsWatcher = null;
+    }
+  }
+}
+
+function compareVersions(a, b) {
+  const split = (v) => String(v || '').replace(/^v/, '').split(/[.-]/).map(s => /^\d+$/.test(s) ? parseInt(s, 10) : s);
+  const pa = split(a), pb = split(b);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i] ?? 0, y = pb[i] ?? 0;
+    if (typeof x === 'number' && typeof y === 'number') {
+      if (x !== y) return x - y;
+    } else if (String(x) !== String(y)) {
+      return String(x) < String(y) ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+function fetchLatestRelease(repo) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(
+      `https://api.github.com/repos/${repo}/releases/latest`,
+      { headers: { 'User-Agent': 'tree-ide-update-check', 'Accept': 'application/vnd.github+json' } },
+      (res) => {
+        if (res.statusCode !== 200) {
+          res.resume();
+          return reject(new Error(`HTTP ${res.statusCode}`));
+        }
+        let body = '';
+        res.on('data', (c) => body += c);
+        res.on('end', () => {
+          try {
+            const j = JSON.parse(body);
+            resolve({
+              tag: String(j.tag_name || '').replace(/^v/, ''),
+              htmlUrl: j.html_url || `https://github.com/${repo}/releases`,
+            });
+          } catch (e) { reject(e); }
+        });
+      }
+    );
+    req.setTimeout(8000, () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+  });
+}
+
+module.exports = { Backend, normalizeOpenRoot, isTooBroad, expandHome, compareVersions, fetchLatestRelease };

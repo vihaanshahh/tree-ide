@@ -5,10 +5,10 @@
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
   <title>Tree</title>
-  <link rel="stylesheet" href="../node_modules/@xterm/xterm/css/xterm.css" />
+  <link rel="stylesheet" href="vendor/xterm.css" />
   <link rel="stylesheet" href="styles.css" />
-  <script src="../node_modules/@xterm/xterm/lib/xterm.js"></script>
-  <script src="../node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
+  <script src="vendor/xterm.js"></script>
+  <script src="vendor/addon-fit.js"></script>
 </head>
 <body>
   <div id="titlebar">
@@ -41,6 +41,7 @@
       <button id="theme-toggle" class="ghost-btn" title="Toggle theme">◐</button>
       <button id="recent-toggle" class="ghost-btn" title="Recent repos">Recent</button>
       <div id="recent-menu" class="recent-menu hidden"></div>
+      <button id="ssh-connect-btn" class="ghost-btn" title="Connect to a remote machine over SSH">Remote</button>
       <button id="open-folder-btn" class="primary-btn">Open Repo</button>
     </div>
   </div>
@@ -140,7 +141,10 @@
         <li>Run agents (shell, claude, codex) right inside the app, side by side.</li>
         <li>Every write on disk flashes the touched node on the graph in real time.</li>
       </ul>
-      <button id="welcome-open" class="primary-btn big">Open a Repo</button>
+      <div class="welcome-actions">
+        <button id="welcome-open" class="primary-btn big">Open a Repo</button>
+        <button id="welcome-ssh" class="ghost-btn big">Connect Remote (SSH)</button>
+      </div>
       <div class="recent-panel">
         <div class="recent-head">
           <span>Recent repos</span>
@@ -152,6 +156,35 @@
   </div>
 
 
+  <!-- SSH connect modal -->
+  <div id="ssh-modal" class="modal hidden">
+    <div class="modal-content modal-narrow">
+      <h2>Connect over SSH</h2>
+      <p class="dim">Run Tree IDE on a remote machine, render it here. Needs key-based SSH access and <code>tree-ide</code> installed on the remote.</p>
+      <label class="form-row">
+        <span>SSH host</span>
+        <input id="ssh-host" placeholder="user@host" autocomplete="off" spellcheck="false" />
+      </label>
+      <label class="form-row">
+        <span>Remote path <em class="dim">(optional)</em></span>
+        <input id="ssh-path" placeholder="/path/to/repo" autocomplete="off" spellcheck="false" />
+      </label>
+      <label class="form-row">
+        <span>Identity file <em class="dim">(optional)</em></span>
+        <input id="ssh-identity" placeholder="~/.ssh/id_ed25519" autocomplete="off" spellcheck="false" />
+      </label>
+      <div id="ssh-status" class="ssh-status hidden"></div>
+      <div class="modal-actions">
+        <button id="ssh-cancel" class="ghost-btn">Cancel</button>
+        <button id="ssh-connect" class="primary-btn">Connect</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast notifications (errors, disconnects, etc.) -->
+  <div id="toast-stack" aria-live="polite"></div>
+
+  <script src="transport.js"></script>
   <script src="graph.js"></script>
   <script src="app.js"></script>
 </body>
