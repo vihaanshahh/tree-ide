@@ -20,6 +20,15 @@ const LAYER_DEFS = [
 const LAYER_OF_KIND = {};
 for (const L of LAYER_DEFS) for (const k of L.kinds) LAYER_OF_KIND[k] = L.id;
 
+// Display order for kinds inside a module panel: same flow as LAYER_DEFS
+// (interface → server → data → support), so a panel reads top-to-bottom
+// like the architectural stack within that folder.
+const KIND_ORDER = new Map();
+{
+  let i = 0;
+  for (const L of LAYER_DEFS) for (const k of L.kinds) KIND_ORDER.set(k, i++);
+}
+
 const KIND_PRETTY = {
   page: 'Pages', component: 'Components', hook: 'Hooks', store: 'Stores', layout: 'Layouts',
   styles: 'Styles', loading: 'Loading', error: 'Errors', template: 'Templates',
@@ -186,6 +195,106 @@ function bgAlpha(alpha) {
 const FONT_MONO = '"NB Akademie Mono", "Space Mono", ui-monospace, SFMono-Regular, Menlo, monospace';
 const FONT_DISPLAY = '"NB Akademie", "Montserrat", ui-sans-serif, system-ui, sans-serif';
 
+// ============================================================
+// Module-based layout helpers.
+//
+// The diagram is a MAP: each top-level folder is a panel, panels
+// stack into tier rows by import depth (entries on top, primitives
+// on bottom), and within each row modules are ordered by barycenter
+// so cross-module edges read top-to-bottom instead of crisscrossing.
+// Within a panel, files are bucketed by kind into small sections,
+// reusing the existing pill bin-packing.
+// ============================================================
+function moduleKeyOf(f, depth) {
+  const raw = f.dir || (f.id && f.id.includes('/') ? f.id.slice(0, f.id.lastIndexOf('/')) : '');
+  if (!raw) return '·root';
+  const parts = raw.split('/').filter(Boolean);
+  if (!parts.length) return '·root';
+  return parts.slice(0, depth).join('/');
+}
+
+// Pick the folder depth that produces the most "map-like" panel set:
+// enough panels to feel structured, but each panel large enough to be
+// worth its own region. Tries depths 1..3 and scores by panel count
+// and mean panel size.
+function pickModuleDepth(files) {
+  let best = { depth: 1, score: -Infinity };
+  for (let d = 1; d <= 3; d++) {
+    const counts = new Map();
+    for (const f of files) {
+      const k = moduleKeyOf(f, d);
+      counts.set(k, (counts.get(k) || 0) + 1);
+    }
+    const mods = counts.size;
+    const mean = files.length / mods;
+    let score = 0;
+    // Sweet-spot: between 4 and 24 panels.
+    if (mods >= 4 && mods <= 24)   score += 100;
+    if (mods >= 6 && mods <= 16)   score += 40;
+    if (mods < 2)                  score -= 200;
+    if (mods > 40)                 score -= 100;
+    // Sweet-spot for mean panel size: 3..30 files.
+    if (mean >= 3 && mean <= 30)   score += 60;
+    if (mean < 1.5)                score -= 40;
+    if (score > best.score) best = { depth: d, score };
+  }
+  return best.depth;
+}
+
+// Display name for a module key. Strip common monorepo prefixes that
+// don't add information at a glance, since they'd appear on every panel.
+function moduleDisplayName(key) {
+  if (!key || key === '·root') return 'ROOT';
+  return key;
+}
+
+// Build the module adjacency from file-level edges (only counts
+// crossings between different modules). Returns:
+//   out: Map<modA, Map<modB, weight>>  (A → B)
+//   und: Map<modA, Set<modB>>           (any direction)
+function buildModuleAdjacency(fileEdges, filesMap, modOf, moduleIds) {
+  const out = new Map();
+  const und = new Map();
+  for (const m of moduleIds) { out.set(m, new Map()); und.set(m, new Set()); }
+  for (const e of fileEdges) {
+    const sf = filesMap.get(e.source);
+    const tf = filesMap.get(e.target);
+    if (!sf || !tf) continue;
+    if (sf.hidden || tf.hidden) continue;
+    const a = modOf(sf), b = modOf(tf);
+    if (a === b || !moduleIds.has(a) || !moduleIds.has(b)) continue;
+    const inner = out.get(a);
+    inner.set(b, (inner.get(b) || 0) + 1);
+    und.get(a).add(b);
+    und.get(b).add(a);
+  }
+  return { out, und };
+}
+
+// Longest-path tiering. tier(B) = max over edges A→B of tier(A)+1.
+// Capped iterations break cycles by treating later visits as no-ops.
+function computeModuleTiers(out, moduleIds) {
+  const tier = new Map();
+  for (const m of moduleIds) tier.set(m, 0);
+  const MAX = 24;
+  for (let i = 0; i < MAX; i++) {
+    let changed = false;
+    for (const [a, targets] of out) {
+      const ta = tier.get(a);
+      for (const b of targets.keys()) {
+        const tb = tier.get(b);
+        if (ta + 1 > tb) {
+          // Cap the tier so a cyclic chain can't grow without bound.
+          tier.set(b, Math.min(MAX, ta + 1));
+          changed = true;
+        }
+      }
+    }
+    if (!changed) break;
+  }
+  return tier;
+}
+
 class Graph {
   constructor(canvas) {
     this.canvas = canvas;
@@ -280,29 +389,59 @@ class Graph {
   scheduleFrame() {
     if (this.paused || this.frameScheduled) return;
     this.frameScheduled = true;
-    requestAnimationFrame(() => this.frame());
+    requestAnimationFrame(() => {
+      try { this.frame(); }
+      catch (e) {
+        // A single bad frame (e.g. transient NaN during a fullscreen
+        // resize) shouldn't kill the loop. Reset the schedule flag so
+        // the next invalidate() will retry.
+        this.frameScheduled = false;
+        const msg = e && e.message;
+        console.warn('[tree:graph] frame error:', msg);
+        try { window.treeNotify && window.treeNotify('Graph render error: ' + (msg || 'unknown'), 'error'); } catch {}
+      }
+    });
   }
 
   setupCanvas() {
     const resize = () => {
-      const r = this.canvas.getBoundingClientRect();
-      if (r.width < 2 || r.height < 2) return;
-      // Retina 2x canvases roughly quadruple pixel work during panning. A
-      // small cap keeps text readable while cutting a large amount of fill.
-      const rawDpr = window.devicePixelRatio || 1;
-      const nextDpr = rawDpr > 1 ? Math.min(rawDpr, 1.5) : 1;
-      const widthChanged = this.width !== r.width || this.height !== r.height || this.dpr !== nextDpr;
-      this.dpr = nextDpr;
-      this.canvas.width = Math.round(r.width * this.dpr);
-      this.canvas.height = Math.round(r.height * this.dpr);
-      this.width = r.width;
-      this.height = r.height;
-      if (widthChanged) this.relayout();
-      else this.invalidate();
+      try {
+        const r = this.canvas.getBoundingClientRect();
+        if (!isFinite(r.width) || !isFinite(r.height) || r.width < 2 || r.height < 2) return;
+        // Retina 2x canvases roughly quadruple pixel work during panning. A
+        // small cap keeps text readable while cutting a large amount of fill.
+        const rawDpr = window.devicePixelRatio || 1;
+        const nextDpr = rawDpr > 1 ? Math.min(rawDpr, 1.5) : 1;
+        const widthChanged = this.width !== r.width || this.height !== r.height || this.dpr !== nextDpr;
+        this.dpr = nextDpr;
+        this.canvas.width = Math.round(r.width * this.dpr);
+        this.canvas.height = Math.round(r.height * this.dpr);
+        this.width = r.width;
+        this.height = r.height;
+        if (widthChanged) this.relayout();
+        else this.invalidate();
+      } catch (e) {
+        // Don't let a single bad rect (e.g. mid-fullscreen-transition) kill
+        // the renderer. Next resize tick will retry with sane dimensions.
+        const msg = e && e.message;
+        console.warn('[tree:graph] resize skipped:', msg);
+        try { window.treeNotify && window.treeNotify('Graph resize error: ' + (msg || 'unknown'), 'warn'); } catch {}
+      }
+    };
+    // Coalesce resize bursts (macOS fullscreen transitions fire dozens of
+    // events back-to-back; a synchronous relayout per tick can hang the
+    // renderer long enough that Electron kills it).
+    let pendingResize = 0;
+    const scheduleResize = () => {
+      if (pendingResize) return;
+      pendingResize = requestAnimationFrame(() => {
+        pendingResize = 0;
+        resize();
+      });
     };
     this.resizeCanvas = resize;
     resize();
-    window.addEventListener('resize', resize);
+    window.addEventListener('resize', scheduleResize);
   }
 
   refreshSize({ fit = false } = {}) {
@@ -773,43 +912,48 @@ class Graph {
     }
     this.neighborhoodCache = null;
     const ctx = this.ctx;
-    const topPad = (this.topOcclusion ? this.topOcclusion() : 80) + 24;
+    const topPad = (this.topOcclusion ? this.topOcclusion() : 80) + 28;
 
-    // ---- 1. Bucket visible files by layer + kind ----
-    const byLayer = {};
-    for (const L of LAYER_DEFS) byLayer[L.id] = new Map();
-    let visibleNodeCount = 0;
+    // ---- 1. Find visible files ----
+    const allVisible = [];
     for (const f of this.files.values()) {
       const forceVisible = this.searchQuery && this.matchSet.has(f.id);
       if (!this.visibleKinds.has(f.kind) && !forceVisible) { f.hidden = true; continue; }
       f.hidden = false;
-      visibleNodeCount++;
-      const lid = LAYER_OF_KIND[f.kind] || 'support';
-      const m = byLayer[lid];
-      if (!m.has(f.kind)) m.set(f.kind, []);
-      m.get(f.kind).push(f);
+      allVisible.push(f);
     }
-    this.visibleNodeCount = visibleNodeCount;
-    const density = visibleNodeCount <= 80 ? 'small' : visibleNodeCount <= 320 ? 'medium' : 'large';
+    this.visibleNodeCount = allVisible.length;
+    if (!allVisible.length) {
+      this.layers = [];
+      this.refreshVisibleCaches();
+      return;
+    }
+    const N = allVisible.length;
+    const density = N <= 80 ? 'small' : N <= 320 ? 'medium' : 'large';
 
-    // ---- 2. Geometry primitives derived from current font metrics ----
+    // ---- 2. Layout primitives. Module panels are intentionally tighter
+    //         than the old layer columns: smaller PILL_MAX_W so labels
+    //         don't bloat one panel, fewer columns per section so panels
+    //         stay box-shaped and stack predictably.
     const fontPills = `400 12px ${FONT_MONO}`;
     const fontTable = `400 11px ${FONT_MONO}`;
-    const PILL_PAD_X = 18;
-    const PILL_MIN_W = density === 'small' ? 112 : 84;
-    const PILL_MAX_W = density === 'small' ? 520 : density === 'medium' ? 460 : 420;
-    const PILL_H = density === 'small' ? 34 : 30;
+    const PILL_PAD_X = 16;
+    const PILL_MIN_W = density === 'small' ? 112 : density === 'medium' ? 92 : 82;
+    const PILL_MAX_W = density === 'small' ? 360 : density === 'medium' ? 320 : 280;
+    const PILL_H = density === 'small' ? 32 : 28;
     const LABEL_LINE_H = 14;
-    const ITEM_GAP = density === 'small' ? 10 : 8;
-    const ROW_GAP = density === 'small' ? 12 : 10;
-    const SECTION_HEAD_H = 30;
-    const SECTION_GAP = density === 'small' ? 36 : 30;
-    const COL_GAP = density === 'small' ? 52 : density === 'medium' ? 60 : 64;
-    const SAFE_GAP = density === 'small' ? 26 : 22;
+    const ITEM_GAP = 8;
+    const ROW_GAP = 10;
+    const SECTION_HEAD_H = 26;
+    const SECTION_GAP = 22;
+    const PANEL_PAD_X = 14;          // inner left/right padding of each module panel
+    const PANEL_PAD_TOP = 32;        // room for the module title above sections
+    const PANEL_PAD_BOTTOM = 14;
+    const MOD_X_GAP = density === 'small' ? 56 : 44;
+    const MOD_Y_GAP = density === 'small' ? 64 : 56;
 
-    // Measure widest "label" for files in each layer/kind so we can pick a
-    // column width that *always* fits at least one item per row (and as many
-    // as possible for compact items).
+    // Measure the natural width of a label (with kind-specific overrides
+    // for tables, which need to fit their widest column).
     const measureLabel = (f, font) => {
       ctx.font = font;
       if (f.kind === 'table') {
@@ -823,240 +967,138 @@ class Graph {
       return Math.ceil(Math.min(PILL_MAX_W, ctx.measureText(lbl).width + PILL_PAD_X * 2));
     };
 
-    // Per-layer width statistics: collect every visible item's natural width
-    // and derive both median and max so we can size columns dynamically — pack
-    // typical items 2-up while still letting outliers take a full row.
-    const widthsByLayer = {};
-    for (const L of LAYER_DEFS) {
+    // ---- 3. Bucket files into modules (folder-based panels). ----
+    const modDepth = pickModuleDepth(allVisible);
+    const modOf    = (f) => moduleKeyOf(f, modDepth);
+    for (const f of allVisible) f._mod = modOf(f);
+    const moduleMap = new Map();
+    for (const f of allVisible) {
+      const key = f._mod;
+      if (!moduleMap.has(key)) moduleMap.set(key, { id: key, name: moduleDisplayName(key), files: [] });
+      moduleMap.get(key).files.push(f);
+    }
+    const moduleIds = new Set(moduleMap.keys());
+
+    // ---- 4. Lay out each module's interior (panel-local coords). ----
+    // Inner coords start at (0, 0); we translate to world coords later
+    // when placing the panel in its tier row.
+    const layoutPanel = (mod) => {
+      const files = mod.files;
+      // Bucket by kind, ordered by KIND_ORDER (interface → server → data → support).
+      const byKind = new Map();
+      for (const f of files) {
+        if (!byKind.has(f.kind)) byKind.set(f.kind, []);
+        byKind.get(f.kind).push(f);
+      }
+      const orderedKinds = [...byKind.keys()].sort((a, b) => {
+        const ra = KIND_ORDER.has(a) ? KIND_ORDER.get(a) : 99;
+        const rb = KIND_ORDER.has(b) ? KIND_ORDER.get(b) : 99;
+        if (ra !== rb) return ra - rb;
+        return a.localeCompare(b);
+      });
+      // Sort within each kind.
+      for (const k of orderedKinds) {
+        const arr = byKind.get(k);
+        if (k === 'endpoint') {
+          arr.sort((a, b) => {
+            const pa = endpointPathOf(a), pb = endpointPathOf(b);
+            if (pa !== pb) return pa.localeCompare(pb);
+            return endpointVerbRank(a) - endpointVerbRank(b);
+          });
+        } else if (k === 'table') {
+          arr.sort((a, b) => (a.label || '').localeCompare(b.label || ''));
+        } else {
+          arr.sort((a, b) => {
+            const ia = this.importance.get(a.id) || 0;
+            const ib = this.importance.get(b.id) || 0;
+            if (ia !== ib) return ib - ia;
+            return (this.displayLabel(a) || '').localeCompare(this.displayLabel(b) || '');
+          });
+        }
+      }
+      // Pick panel width: max(min, widest-item, median * target-cols).
       const widths = [];
-      const buckets = byLayer[L.id];
-      if (!buckets) { widthsByLayer[L.id] = []; continue; }
-      for (const [k, files] of buckets) {
+      for (const k of orderedKinds) {
         const font = (k === 'table') ? fontTable : fontPills;
-        for (const f of files) widths.push(measureLabel(f, font));
+        for (const f of byKind.get(k)) widths.push(measureLabel(f, font));
       }
       widths.sort((a, b) => a - b);
-      widthsByLayer[L.id] = widths;
-    }
-    const stat = (arr, p) => arr.length ? arr[Math.min(arr.length - 1, Math.floor(arr.length * p))] : 0;
+      const med = widths.length ? widths[Math.floor(widths.length / 2)] : PILL_MIN_W;
+      const max = widths.length ? widths[widths.length - 1] : PILL_MIN_W;
+      // sqrt-cols heuristic, capped at 3 so panels stay narrow and rows can
+      // hold many of them.
+      const targetCols = Math.max(1, Math.min(3, Math.round(Math.sqrt(files.length) / 1.8)));
+      const innerW = Math.ceil(Math.max(
+        PILL_MIN_W,
+        max,
+        med * targetCols + ITEM_GAP * (targetCols - 1),
+      ));
+      const panelW = innerW + PANEL_PAD_X * 2;
 
-    // Decide how wide each layer column should be, dynamically and per content.
-    // The diagram is meant to grow SIDEWAYS, not down — so for crowded layers
-    // we scale columns with sqrt(count) and bias toward more side-by-side
-    // packing instead of letting one section run hundreds of rows tall.
-    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-    const sqrtCols = (count, maxCols, divisor = 1.5) =>
-      clamp(Math.round(Math.sqrt(Math.max(1, count)) / divisor), 1, maxCols);
-    const layerColWidth = (lid) => {
-      const ws = widthsByLayer[lid];
-      if (!ws || !ws.length) return PILL_MIN_W;
-      const buckets = byLayer[lid];
-      const max = ws[ws.length - 1];
-      const count = [...buckets.values()].reduce((sum, files) => sum + files.length, 0);
-      if (buckets.has('table')) {
-        return Math.ceil(max + 24);
-      }
-      if (buckets.has('endpoint')) {
-        const p60 = stat(ws, 0.6);
-        const med = stat(ws, 0.5);
-        const maxCols = density === 'small' ? 4 : density === 'medium' ? 5 : 6;
-        const cols = sqrtCols(count, maxCols, 1.8);
-        const endpointGroups = new Map();
-        for (const f of buckets.get('endpoint') || []) {
-          const key = endpointPathOf(f);
-          if (!endpointGroups.has(key)) endpointGroups.set(key, []);
-          endpointGroups.get(key).push(f);
-        }
-        let groupedW = 0;
-        for (const group of endpointGroups.values()) {
-          if (group.length < 2) continue;
-          const compactW = 118;
-          const groupCols = Math.min(group.length, 4);
-          groupedW = Math.max(groupedW, compactW * groupCols + ITEM_GAP * (groupCols - 1));
-        }
-        return Math.ceil(Math.max(med * cols + ITEM_GAP * (cols - 1), p60 + 24, groupedW + 20) + 16);
-      }
-      if (lid === 'support') {
-        const maxCols = density === 'small' ? 4 : density === 'medium' ? 5 : 6;
-        const cols = sqrtCols(count, maxCols, 1.8);
-        return Math.ceil(Math.max(max, stat(ws, 0.5) * cols + ITEM_GAP * (cols - 1)) + 16);
-      }
-      const med = stat(ws, 0.5);
-      const maxCols = density === 'small' ? 4 : density === 'medium' ? 6 : 8;
-      const cols = sqrtCols(count, maxCols, 1.5);
-      return Math.ceil(Math.max(max + 16, med * cols + ITEM_GAP * (cols - 1) + 24));
-    };
-
-    // ---- 3. Decide which layers are present, in display order ----
-    const activeLayers = LAYER_DEFS
-      .filter(L => byLayer[L.id] && byLayer[L.id].size)
-      .map(L => ({ L, w: layerColWidth(L.id) }));
-
-    if (!activeLayers.length) {
-      this.layers = [];
-      this.refreshVisibleCaches();
-      return;
-    }
-
-    // ---- 4. Build each layer at x=0 first, then center horizontally ----
-    // We defer horizontal placement so bin-packing inside a layer (which can
-    // widen the layer beyond its initial subColW) doesn't throw off the
-    // overall centering. After every layer's final width is known, a second
-    // pass shifts them into place.
-    const builtLayers = [];
-    for (const { L, w: subColW } of activeLayers) {
-      const layer = {
-        id: L.id, name: L.name, sections: [],
-        x: 0, y: topPad, w: subColW, h: 0,
-      };
-      // ---- 5a. Lay out sections vertically inside one sub-column ----
-      let yCursor = layer.y + 6;
-      let lastBottom = yCursor;
-
-      const orderedKinds = L.kinds.filter(k => byLayer[L.id].has(k));
-      // Kinds where clustering by folder makes a crowded section legible.
-      // Beyond a threshold we split the section into one mini-section per
-      // folder so 200 components are presented as a handful of nameable
-      // groups instead of a wall.
-      const DIR_GROUPED = new Set(['component', 'hook', 'store', 'job', 'service', 'server-action', 'model', 'styles', 'test', 'module']);
-      const FOLDER_SPLIT_THRESHOLD = 40;
-      const dirKey = (f) => {
-        const d = f.dir || '';
-        if (!d) return '';
-        return d.split('/').pop() || d;
-      };
-
-      // First sort each kind's files; then optionally split into per-folder
-      // sub-sections. We never cap or hide anything — bin-packing handles the
-      // resulting height.
-      const units = [];
+      // Now lay sections vertically inside (0, 0)-based panel.
+      const sections = [];
+      const sectionX = PANEL_PAD_X;
+      const sectionW = innerW;
+      let yCursor   = PANEL_PAD_TOP;
       for (const k of orderedKinds) {
-        const allK = byLayer[L.id].get(k).slice().sort((a, b) => {
-          if (k === 'table' && a.parentFile && b.parentFile && a.parentFile !== b.parentFile) {
-            return a.parentFile.localeCompare(b.parentFile);
-          }
-          if (k === 'endpoint') {
-            const pa = endpointPathOf(a);
-            const pb = endpointPathOf(b);
-            if (pa !== pb) return pa.localeCompare(pb);
-            const va = endpointVerbRank(a);
-            const vb = endpointVerbRank(b);
-            if (va !== vb) return va - vb;
-            if (a.parentFile && b.parentFile && a.parentFile !== b.parentFile) return a.parentFile.localeCompare(b.parentFile);
-            return a.id.localeCompare(b.id);
-          }
-          if (DIR_GROUPED.has(k)) {
-            const da = dirKey(a);
-            const db = dirKey(b);
-            if (da !== db) return da.localeCompare(db);
-          }
-          const ia = this.importance.get(a.id) || 0;
-          const ib = this.importance.get(b.id) || 0;
-          if (ia !== ib) return ib - ia;
-          return (this.displayLabel(a) || '').localeCompare(this.displayLabel(b) || '');
-        });
-
-        if (DIR_GROUPED.has(k) && allK.length > FOLDER_SPLIT_THRESHOLD) {
-          const folderGroups = new Map();
-          for (const f of allK) {
-            const folder = dirKey(f) || '·';
-            if (!folderGroups.has(folder)) folderGroups.set(folder, []);
-            folderGroups.get(folder).push(f);
-          }
-          const folders = [...folderGroups.entries()].sort((a, b) => {
-            if (a[1].length !== b[1].length) return b[1].length - a[1].length;
-            return a[0].localeCompare(b[0]);
-          });
-          for (const [folder, files] of folders) {
-            units.push({
-              kind: k,
-              name: folder === '·' ? (KIND_PRETTY[k] || k) : `${KIND_PRETTY[k] || k} · ${folder}`,
-              files,
-              allCount: files.length,
-            });
-          }
-        } else {
-          units.push({
-            kind: k,
-            name: KIND_PRETTY[k] || k,
-            files: allK,
-            allCount: allK.length,
-          });
-        }
-      }
-
-      for (const u of units) {
-        const k = u.kind;
-        const filesK = u.files;
+        const filesK = byKind.get(k);
         for (const f of filesK) f.hidden = false;
-
-        yCursor = Math.max(yCursor, lastBottom + SAFE_GAP);
         const section = {
-          kind: k, name: u.name,
-          files: filesK,
-          allCount: u.allCount,
-          hiddenCount: 0,
-          canExpand: false,
-          expanded: true,
-          x: layer.x + 6, y: yCursor, w: layer.w - 12, h: 0,
+          kind: k, name: KIND_PRETTY[k] || k,
+          files: filesK, allCount: filesK.length, hiddenCount: 0,
+          canExpand: false, expanded: true,
+          x: sectionX, y: yCursor, w: sectionW, h: 0,
         };
-
-        // Per-section item layout: dynamic — auto-width to label, wrap by row
-        const headerY = yCursor + SECTION_HEAD_H;
-        const innerW = section.w - 4;
-        let placeX = section.x + 2;
-        let rowY = headerY;
-        let rowMaxBottom = rowY;
+        const headerY     = yCursor + SECTION_HEAD_H;
+        const innerLeft   = section.x + 2;
+        const innerRight  = section.x + section.w - 2;
+        let placeX        = innerLeft;
+        let rowY          = headerY;
+        let rowMaxBottom  = rowY;
 
         const placeNode = (f, w, h) => {
-          if (placeX + w > section.x + innerW && placeX !== section.x + 2) {
-            placeX = section.x + 2;
-            rowY = rowMaxBottom + ROW_GAP;
+          if (placeX + w > innerRight && placeX !== innerLeft) {
+            placeX = innerLeft;
+            rowY   = rowMaxBottom + ROW_GAP;
           }
-          f.w = w;
-          f.h = h;
-          f.x = placeX;
-          f.y = rowY;
+          f.w = w; f.h = h;
+          f.x = placeX; f.y = rowY;
           f.hidden = false;
           placeX += w + ITEM_GAP;
           rowMaxBottom = Math.max(rowMaxBottom, rowY + h);
         };
-
-        const sizeDefaultNode = (f) => {
-          let w, h;
+        const sizeDefault = (f) => {
           if (f.kind === 'table') {
             const cols = f.columns || [];
             const expanded = this.expandedTables.has(f.id);
             const visCols = expanded ? cols : cols.slice(0, this.TABLE_PREVIEW_ROWS);
-            f._visibleCols = visCols;
+            f._visibleCols   = visCols;
             f._tableExpanded = expanded;
-            f._showFooter = cols.length > this.TABLE_PREVIEW_ROWS;
-            f._moreCount = Math.max(0, cols.length - visCols.length);
+            f._showFooter    = cols.length > this.TABLE_PREVIEW_ROWS;
+            f._moreCount     = Math.max(0, cols.length - visCols.length);
             const headerH = 26, rowH = 17;
-            w = innerW;                                   // tables fill column width
-            h = headerH + visCols.length * rowH + (f._showFooter ? 24 : 8);
-          } else {
-            f._endpointCompact = false;
-            f._endpointPath = '';
-            f._endpointVerb = '';
-            const labelW = measureLabel(f, fontPills);
-            const cap = PILL_MAX_W;
-            w = Math.max(PILL_MIN_W, Math.min(cap, labelW));
-            const imp = this.importance.get(f.id) || 0;
-            f._importance = imp;
-            w = Math.min(cap, Math.ceil(w + Math.min(36, Math.log2(imp + 1) * 6)));
-            if (w > innerW) w = innerW;
-            const labelMaxW = Math.max(20, w - PILL_PAD_X * 2);
-            f._labelLines = this.wrapLabel(ctx, this.displayLabel(f), labelMaxW, f.kind === 'endpoint' ? 3 : 2);
-            const textH = f._labelLines.length * LABEL_LINE_H;
-            const endpointMetaH = f.kind === 'endpoint' ? 16 : 0;
-            const minH = f.kind === 'endpoint' ? 48 : PILL_H;
-            h = Math.max(minH, textH + 14 + endpointMetaH + Math.min(6, Math.log2(imp + 1) * 1.4));
+            return { w: sectionW, h: headerH + visCols.length * rowH + (f._showFooter ? 24 : 8) };
           }
+          f._endpointCompact = false;
+          f._endpointPath    = '';
+          f._endpointVerb    = '';
+          const labelW = measureLabel(f, fontPills);
+          let w = Math.max(PILL_MIN_W, Math.min(PILL_MAX_W, labelW));
+          const imp = this.importance.get(f.id) || 0;
+          f._importance = imp;
+          w = Math.min(PILL_MAX_W, Math.ceil(w + Math.min(32, Math.log2(imp + 1) * 5)));
+          if (w > sectionW) w = sectionW;
+          const labelMaxW = Math.max(20, w - PILL_PAD_X * 2);
+          f._labelLines   = this.wrapLabel(ctx, this.displayLabel(f), labelMaxW, f.kind === 'endpoint' ? 3 : 2);
+          const textH         = f._labelLines.length * LABEL_LINE_H;
+          const endpointMetaH = f.kind === 'endpoint' ? 16 : 0;
+          const minH          = f.kind === 'endpoint' ? 48 : PILL_H;
+          const h = Math.max(minH, textH + 14 + endpointMetaH + Math.min(6, Math.log2(imp + 1) * 1.4));
           return { w, h };
         };
 
         if (k === 'endpoint') {
+          // Verb-collapsing: GET/POST/PUT for the same path share a row.
           const groups = [];
           for (const f of filesK) {
             const key = endpointPathOf(f);
@@ -1066,107 +1108,120 @@ class Graph {
           }
           for (const group of groups) {
             if (group.files.length > 1) {
-              if (placeX !== section.x + 2) {
-                placeX = section.x + 2;
-                rowY = rowMaxBottom + ROW_GAP;
+              if (placeX !== innerLeft) {
+                placeX = innerLeft;
+                rowY   = rowMaxBottom + ROW_GAP;
               }
-              const minMethodW = 96;
-              const maxCols = Math.max(1, Math.floor((innerW + ITEM_GAP) / (minMethodW + ITEM_GAP)));
-              const cols = Math.max(1, Math.min(group.files.length, maxCols));
-              const compactW = Math.max(minMethodW, Math.min(132, Math.floor((innerW - ITEM_GAP * (cols - 1)) / cols)));
+              const minMethodW = 90;
+              const maxCols    = Math.max(1, Math.floor((sectionW + ITEM_GAP) / (minMethodW + ITEM_GAP)));
+              const cols       = Math.max(1, Math.min(group.files.length, maxCols));
+              const compactW   = Math.max(minMethodW, Math.min(124, Math.floor((sectionW - ITEM_GAP * (cols - 1)) / cols)));
               for (const f of group.files) {
                 f._endpointCompact = true;
-                f._endpointPath = group.key;
-                f._endpointVerb = endpointVerbOf(f) || 'API';
-                f._labelLines = [f._endpointVerb, group.key];
-                const imp = this.importance.get(f.id) || 0;
-                f._importance = imp;
-                placeNode(f, compactW, 52);
+                f._endpointPath    = group.key;
+                f._endpointVerb    = endpointVerbOf(f) || 'API';
+                f._labelLines      = [f._endpointVerb, group.key];
+                f._importance      = this.importance.get(f.id) || 0;
+                placeNode(f, compactW, 48);
               }
-              placeX = section.x + 2;
-              rowY = rowMaxBottom + ROW_GAP;
+              placeX = innerLeft;
+              rowY   = rowMaxBottom + ROW_GAP;
             } else {
               const f = group.files[0];
-              const box = sizeDefaultNode(f);
+              const box = sizeDefault(f);
               placeNode(f, box.w, box.h);
             }
           }
         } else {
           for (const f of filesK) {
-            const box = sizeDefaultNode(f);
+            const box = sizeDefault(f);
             placeNode(f, box.w, box.h);
           }
         }
 
-        section.h = (rowMaxBottom + (filesK.some(f => f.kind === 'table') ? 6 : 14)) - yCursor;
-        layer.sections.push(section);
-
-        let bottom = rowMaxBottom;
-        for (const f of filesK) {
-          if (!f.hidden && (f.y + f.h) > bottom) bottom = f.y + f.h + 6;
-        }
-        lastBottom = bottom;
-        yCursor = lastBottom + SECTION_GAP;
+        section.h = (rowMaxBottom + (filesK.some(f => f.kind === 'table') ? 6 : 12)) - yCursor;
+        sections.push(section);
+        yCursor = rowMaxBottom + SECTION_GAP;
       }
+      const panelH = Math.max(70, (yCursor - SECTION_GAP) + PANEL_PAD_BOTTOM);
+      mod.sections = sections;
+      mod._panelW = panelW;
+      mod._panelH = panelH;
+    };
+    for (const mod of moduleMap.values()) layoutPanel(mod);
 
-      layer.h = Math.max(0, lastBottom - layer.y);
+    // ---- 5. Build module-level DAG, then tier by longest-path. ----
+    const { out: modOut } = buildModuleAdjacency(this.fileEdges, this.files, modOf, moduleIds);
+    const tier = computeModuleTiers(modOut, moduleIds);
 
-      // ---- 5b. Bin-pack sections into multiple sub-columns when the layer
-      //          is much taller than wide. This is what lets a big repo
-      //          grow horizontally: instead of one tower of 25 sections, we
-      //          place sections greedily into the shortest available
-      //          sub-column. Nothing is hidden — only re-positioned.
-      const SUB_GAP = COL_GAP;
-      // Roughly target an aspect ratio of 1:1.4 (height ≈ 1.4 × width) before
-      // splitting into another sub-column. Always allow at least one sub-col
-      // and cap at 6 so the overall diagram stays browsable.
-      const aspectTarget = Math.max(700, subColW * 1.4);
-      let K = 1;
-      if (layer.sections.length > 1 && layer.h > aspectTarget) {
-        K = Math.min(layer.sections.length, 6, Math.ceil(layer.h / aspectTarget));
-      }
-      if (K > 1) {
-        const colHeights = new Array(K).fill(layer.y + 6);
-        for (const s of layer.sections) {
-          let best = 0;
-          for (let i = 1; i < K; i++) if (colHeights[i] < colHeights[best]) best = i;
-          const newX = layer.x + 6 + best * (subColW + SUB_GAP);
-          const newY = colHeights[best];
-          const dx = newX - s.x;
-          const dy = newY - s.y;
-          s.x += dx;
-          s.y += dy;
-          for (const f of s.files) {
-            if (f.hidden) continue;
-            f.x += dx;
-            f.y += dy;
+    // Group modules into tier rows.
+    const byTier = new Map();
+    for (const mod of moduleMap.values()) {
+      const t = tier.get(mod.id) || 0;
+      if (!byTier.has(t)) byTier.set(t, []);
+      byTier.get(t).push(mod);
+    }
+    const tierKeys = [...byTier.keys()].sort((a, b) => a - b);
+
+    // ---- 6. Place tier rows top-to-bottom. Within each row, modules are
+    //         ordered by barycenter so cross-tier edges trend vertically
+    //         instead of crisscrossing horizontally. ----
+    const placedCenterX = new Map();
+    let yCursor = topPad;
+
+    for (const tIdx of tierKeys) {
+      const rowMods = byTier.get(tIdx);
+      if (tIdx === tierKeys[0]) {
+        // First tier (entry points): largest panels first.
+        rowMods.sort((a, b) => b.files.length - a.files.length || a.id.localeCompare(b.id));
+      } else {
+        for (const mod of rowMods) {
+          let sum = 0, n = 0;
+          for (const otherId of placedCenterX.keys()) {
+            const fromOther = modOut.get(otherId);
+            const fromSelf  = modOut.get(mod.id);
+            if ((fromOther && fromOther.has(mod.id)) || (fromSelf && fromSelf.has(otherId))) {
+              sum += placedCenterX.get(otherId);
+              n++;
+            }
           }
-          colHeights[best] = s.y + s.h + SECTION_GAP;
+          mod._barycenter = n ? sum / n : 0;
         }
-        layer.w = K * subColW + (K - 1) * SUB_GAP;
-        layer.h = Math.max(...colHeights) - layer.y;
+        const orig = new Map(rowMods.map((m, i) => [m.id, i]));
+        rowMods.sort((a, b) => {
+          const ba = a._barycenter, bb = b._barycenter;
+          if (ba !== bb) return ba - bb;
+          return orig.get(a.id) - orig.get(b.id);
+        });
       }
-
-      builtLayers.push(layer);
+      const rowW = rowMods.reduce((s, m) => s + m._panelW, 0) + MOD_X_GAP * Math.max(0, rowMods.length - 1);
+      let xCursor = -rowW / 2;
+      let rowH = 0;
+      for (const mod of rowMods) {
+        // Translate inner coords (panel-local) into world space.
+        for (const s of mod.sections) {
+          s.x += xCursor; s.y += yCursor;
+          for (const f of s.files) { f.x += xCursor; f.y += yCursor; }
+        }
+        mod.x = xCursor;
+        mod.y = yCursor;
+        placedCenterX.set(mod.id, xCursor + mod._panelW / 2);
+        xCursor += mod._panelW + MOD_X_GAP;
+        rowH = Math.max(rowH, mod._panelH);
+      }
+      yCursor += rowH + MOD_Y_GAP;
     }
 
-    // ---- 6. Center the finished layers horizontally. ----
-    const finalTotalW = builtLayers.reduce((s, l) => s + l.w, 0) + COL_GAP * Math.max(0, builtLayers.length - 1);
-    let xCursor = -finalTotalW / 2;
-    for (const layer of builtLayers) {
-      const dx = xCursor - layer.x;
-      if (dx !== 0) {
-        layer.x = xCursor;
-        for (const s of layer.sections) {
-          s.x += dx;
-          for (const f of s.files) {
-            if (!f.hidden) f.x += dx;
-          }
-        }
-      }
-      xCursor += layer.w + COL_GAP;
-    }
-    this.layers = builtLayers;
+    // ---- 7. Publish layers (one entry per module panel). The renderer
+    //         iterates these to draw panel chrome + sections. ----
+    this.layers = [...moduleMap.values()].map(m => ({
+      id: 'mod:' + m.id,
+      name: m.name,
+      isModule: true,
+      fileCount: m.files.length,
+      x: m.x, y: m.y, w: m._panelW, h: m._panelH,
+      sections: m.sections,
+    }));
 
     // AI is no longer rendered on the canvas
     this.aiNode.x = -99999;
@@ -1620,20 +1675,25 @@ class Graph {
       return !(maxX < vb.minX || minX > vb.maxX || maxY < vb.minY || minY > vb.maxY);
     };
 
-    // ----- Section headers (cthdrl: ghost-sand mono labels, thin rules) -----
+    // ----- Module panel chrome (title + thin box) + section headers -----
     for (const L of this.layers) {
+      // Module title above the panel.
       ctx.font = `400 11px ${FONT_MONO}`;
-      ctx.fillStyle = L.id === 'data' ? tintRGB('table', 0.85) : `rgba(${SAND}, 0.55)`;
+      ctx.fillStyle = `rgba(${SAND}, 0.62)`;
       ctx.textAlign = 'left';
       ctx.textBaseline = 'top';
-      ctx.fillText(L.id === 'data' ? 'DATA / SQL' : L.name, L.x, L.y - 24);
-      // vertical rule on the column's left
-      ctx.strokeStyle = L.id === 'data' ? tintRGB('table', 0.35) : `rgba(${SAND}, 0.14)`;
+      ctx.fillText(String(L.name || '').toUpperCase(), L.x + 2, L.y + 6);
+      // Count badge to the right of the title.
+      if (typeof L.fileCount === 'number') {
+        const title = String(L.name || '').toUpperCase();
+        const tw = ctx.measureText(title).width;
+        ctx.fillStyle = `rgba(${SAND}, 0.36)`;
+        ctx.fillText(`× ${L.fileCount}`, L.x + 2 + tw + 10, L.y + 8);
+      }
+      // Faint border around the whole panel — gives the "map region" feel.
+      ctx.strokeStyle = `rgba(${SAND}, 0.10)`;
       ctx.lineWidth = 1 / z;
-      ctx.beginPath();
-      ctx.moveTo(L.x - 14, L.y - 8);
-      ctx.lineTo(L.x - 14, L.y + L.h + 8);
-      ctx.stroke();
+      ctx.strokeRect(L.x, L.y, L.w, L.h);
       for (const s of L.sections) {
         const isHoverSection = this.hovered && this.hovered.kind === 'section' && this.hovered.sectionKind === s.kind;
         const tint = tintRGB(s.kind);
@@ -1688,10 +1748,11 @@ class Graph {
           (isSearching && (this.matchSet.has(a.id) || this.matchSet.has(b.id)));
         if (isHighlighted) continue;
 
-        const crossKind = a.kind !== b.kind;
-        const aLayer = LAYER_OF_KIND[a.kind] || 'support';
-        const bLayer = LAYER_OF_KIND[b.kind] || 'support';
-        const crossLayer = aLayer !== bLayer;
+        const crossKind   = a.kind !== b.kind;
+        // Cross-module edges are the load-bearing structural lines in
+        // the new layout — they connect distinct panels in the map.
+        const crossModule = (a._mod && b._mod && a._mod !== b._mod);
+        const crossLayer  = crossModule;
         let alpha, lineW, dashed = false;
         if (e.isFk) {
           alpha = anyActive ? 0.08 : 0.28;
