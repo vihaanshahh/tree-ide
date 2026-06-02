@@ -57,7 +57,7 @@ if (fs.existsSync(ptyNode)) {
   }
 }
 
-const result = spawnSync('npx', ['--no-install', 'electron-rebuild', '-f', '-w', 'node-pty'], {
+const result = spawnSync('npx', ['--no-install', 'electron-rebuild', '-f', '-o', 'node-pty'], {
   stdio: 'inherit',
   shell: true,
   env: process.env,
