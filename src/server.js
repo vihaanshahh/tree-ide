@@ -39,6 +39,7 @@ const RENDERER_FILES = new Set([
   'index.html',
   'app.js',
   'graph.js',
+  'layout.worker.js',
   'styles.css',
   'logo.svg',
   'transport.js',
@@ -116,6 +117,7 @@ function buildRouter(backend) {
 const BROADCAST_EVENTS = [
   'pty:data', 'pty:exit',
   'fs:event',
+  'graph:patch',
   'repo:scan-progress',
   'app:open-root',
   'app:update-progress',
@@ -149,15 +151,8 @@ async function startServer({ backend, host = '127.0.0.1', port = 0, token = null
           res.end('Failed to read index.html: ' + err.message);
           return;
         }
-        const queryToken = parsed.query && parsed.query.token;
-        // Browser pages get the token via query (?token=...). The
-        // Electron BrowserWindow load URL also embeds the token, so the
-        // same injection works in both modes.
-        const tokenForPage = typeof queryToken === 'string' ? queryToken : '';
-        const inject = `<script>window.__TREE_TOKEN__ = ${JSON.stringify(tokenForPage)};</script>\n`;
-        const patched = html.replace('</head>', inject + '</head>');
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
-        res.end(patched);
+        res.end(html);
       });
       return;
     }

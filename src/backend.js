@@ -98,6 +98,55 @@ function shellQuote(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
 }
 
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(k => `${JSON.stringify(k)}:${stableJson(value[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function graphState(graph = {}) {
+  const nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
+  const edges = Array.isArray(graph.edges) ? graph.edges : [];
+  return {
+    nodes,
+    edges,
+    nodesById: new Map(nodes.map(n => [n.id, n])),
+    edgesById: new Map(edges.map(e => [e.id, e])),
+    nodeSigById: new Map(nodes.map(n => [n.id, stableJson(n)])),
+    edgeSigById: new Map(edges.map(e => [e.id, stableJson(e)])),
+  };
+}
+
+function diffGraphStates(prev, next, meta = {}) {
+  const patch = {
+    ...meta,
+    nodes: { add: [], update: [], remove: [] },
+    edges: { add: [], update: [], remove: [] },
+  };
+
+  for (const [id, node] of next.nodesById) {
+    if (!prev.nodesById.has(id)) patch.nodes.add.push(node);
+    else if (prev.nodeSigById.get(id) !== next.nodeSigById.get(id)) patch.nodes.update.push(node);
+  }
+  for (const id of prev.nodesById.keys()) {
+    if (!next.nodesById.has(id)) patch.nodes.remove.push(id);
+  }
+
+  for (const [id, edge] of next.edgesById) {
+    if (!prev.edgesById.has(id)) patch.edges.add.push(edge);
+    else if (prev.edgeSigById.get(id) !== next.edgeSigById.get(id)) patch.edges.update.push(edge);
+  }
+  for (const id of prev.edgesById.keys()) {
+    if (!next.edgesById.has(id)) patch.edges.remove.push(id);
+  }
+
+  patch.empty = !patch.nodes.add.length && !patch.nodes.update.length && !patch.nodes.remove.length &&
+    !patch.edges.add.length && !patch.edges.update.length && !patch.edges.remove.length;
+  return patch;
+}
+
 class Backend {
   constructor(opts = {}) {
     this.events = new EventEmitter();
@@ -115,6 +164,11 @@ class Backend {
     this.electronHooks = opts.electronHooks || null;
     this.pkg = opts.pkg || { version: '0.0.0' };
     this.updateRepo = opts.updateRepo || 'vihaanshahh/tree-ide';
+    this.currentGraph = graphState({ nodes: [], edges: [] });
+    this.graphPatchTimer = null;
+    this.graphPatchInFlight = false;
+    this.graphPatchPending = false;
+    this.graphPatchSeq = 0;
   }
 
   // -------------------------------------------------------------------
@@ -137,6 +191,7 @@ class Backend {
           }
         },
       });
+      this.currentGraph = graphState(graph);
       this.events.emit('repo:scan-progress', { status: 'done', count: graph.fileCount, ms: graph.elapsedMs });
       this.startFsWatcher(rootPath);
       return graph;
@@ -193,6 +248,7 @@ class Backend {
         const rel = path.relative(root, full);
         if (!rel || rel.startsWith('..')) return;
         this.events.emit('fs:event', { type, path: rel, fullPath: full, at: Date.now() });
+        this.scheduleGraphPatch(type);
       };
       this.fsWatcher.on('add',    emit('add'));
       this.fsWatcher.on('change', emit('change'));
@@ -205,6 +261,57 @@ class Backend {
   watchFs(root) {
     this.startFsWatcher(root || this.currentRoot);
     return { ok: true };
+  }
+
+  scheduleGraphPatch(type = 'change') {
+    if (!this.currentRoot) return;
+    const delay = type === 'change' ? 550 : 180;
+    this.graphPatchPending = true;
+    clearTimeout(this.graphPatchTimer);
+    this.graphPatchTimer = setTimeout(() => {
+      this.graphPatchTimer = null;
+      this.rebuildGraphPatch();
+    }, delay);
+  }
+
+  async rebuildGraphPatch() {
+    if (!this.currentRoot) return;
+    if (this.graphPatchInFlight) {
+      this.graphPatchPending = true;
+      return;
+    }
+    const root = this.currentRoot;
+    const seq = ++this.graphPatchSeq;
+    this.graphPatchPending = false;
+    this.graphPatchInFlight = true;
+    this.events.emit('repo:scan-progress', { status: 'patching', root });
+    try {
+      const graph = await buildGraph(root, {
+        concurrency: 64,
+        includeFnEdges: false,
+        onProgress: (done, total) => {
+          if (done === total || done % 100 === 0) {
+            this.events.emit('repo:scan-progress', { status: 'patching', done, total });
+          }
+        },
+      });
+      if (root !== this.currentRoot) return;
+      const next = graphState(graph);
+      const patch = diffGraphStates(this.currentGraph, next, {
+        seq,
+        root,
+        fileCount: graph.fileCount,
+        elapsedMs: graph.elapsedMs,
+      });
+      this.currentGraph = next;
+      this.events.emit('graph:patch', patch);
+      this.events.emit('repo:scan-progress', { status: 'done', count: graph.fileCount, ms: graph.elapsedMs, patch: true });
+    } catch (e) {
+      this.events.emit('repo:scan-progress', { status: 'error', error: e.message });
+    } finally {
+      this.graphPatchInFlight = false;
+      if (this.graphPatchPending && root === this.currentRoot) this.scheduleGraphPatch('change');
+    }
   }
 
   // -------------------------------------------------------------------

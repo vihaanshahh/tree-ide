@@ -2,6 +2,26 @@
 
 All notable changes to Tree IDE.
 
+## [0.3.1] - 2026-06-01
+
+### Added
+
+- AST-assisted import/export extraction for JS, TS, TSX, Python, Go, and Rust,
+  with smoke coverage across the graph engine and Electron renderer.
+- Incremental graph patch broadcasts for filesystem changes, so the renderer can
+  update nodes and edges without a full reload.
+- Off-main-thread layout for large graphs, with a synchronous fallback.
+
+### Fixed
+
+- Avoid loading Tree-Sitter native bindings inside Electron unless explicitly
+  enabled, preventing the native crash seen during renderer smoke tests.
+- Preserve legacy regex edges when AST analysis is available, so the parser path
+  cannot erase existing graph relationships.
+- Connect non-code relationships such as HTML stylesheets/scripts, CSS imports,
+  Sass partials, and same-name companion CSS modules.
+- Serve the layout worker under the app's CSP-safe asset path.
+
 ## [0.3.0] - 2026-05-19
 
 ### Added
@@ -67,6 +87,7 @@ Linux/WSL: render reliably out of the box. `install.sh` fixes for Node ≥ 18.
 
 Embedded agents, live filesystem reactivity, branded titlebar.
 
+[0.3.1]: https://github.com/vihaanshahh/tree-ide/releases/tag/v0.3.1
 [0.3.0]: https://github.com/vihaanshahh/tree-ide/releases/tag/v0.3.0
 [0.2.3]: https://github.com/vihaanshahh/tree-ide/releases/tag/v0.2.3
 [0.2.0]: https://github.com/vihaanshahh/tree-ide/releases/tag/v0.2.0

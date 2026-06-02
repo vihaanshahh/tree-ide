@@ -351,6 +351,15 @@ function renderFileDetail(f) {
     import: 'import',
     external: 'external',
   }[e.type] || e.type || 'link');
+  const edgeLabel = (e) => {
+    if (e.type === 'import') {
+      if (e.reason === 'stylesheet') return 'stylesheet';
+      if (e.reason === 'script') return 'script';
+      if (e.reason === 'companion-style') return 'style companion';
+      if (e.reason === 'asset') return 'asset';
+    }
+    return edgeKind(e);
+  };
   const dbOpsText = (e) => {
     const ops = e.operations || e.dbOps || [];
     const label = {
@@ -364,15 +373,15 @@ function renderFileDetail(f) {
   };
   const edgeMeta = (e) => {
     if (e.type === 'api-call') {
-      return [edgeKind(e), e.apiMethod, e.apiPath, e.via ? `via ${labelOf(e.via)}` : ''].filter(Boolean).join(' · ');
+      return [edgeLabel(e), e.apiMethod, e.apiPath, e.via ? `via ${labelOf(e.via)}` : ''].filter(Boolean).join(' · ');
     }
     if (e.type === 'db-query') {
-      return [edgeKind(e), dbOpsText(e)].filter(Boolean).join(' · ');
+      return [edgeLabel(e), dbOpsText(e)].filter(Boolean).join(' · ');
     }
     if (e.type === 'fk') {
-      return [edgeKind(e), e.column && e.targetColumn ? `${e.column} → ${e.targetColumn}` : ''].filter(Boolean).join(' · ');
+      return [edgeLabel(e), e.column && e.targetColumn ? `${e.column} → ${e.targetColumn}` : ''].filter(Boolean).join(' · ');
     }
-    return edgeKind(e);
+    return edgeLabel(e);
   };
   const edgeOrder = (e) => ({
     'api-call': 0,
@@ -1581,9 +1590,8 @@ window.tree.onPtyExit(({ agentId, exitCode, signal }) => {
 });
 
 // ===== Filesystem watcher → graph + ledger =====
-// File create/delete events trigger a debounced full re-scan (cheap — ~350ms
-// on real repos) so node metadata is accurate. We also do an immediate
-// stub-insert / stub-remove so the change is visible right away.
+// File events update the canvas immediately with cheap local hints. The backend
+// follows with a graph:patch after rebuilding the authoritative graph.
 let rescanTimer = null;
 let rescanSeq = 0;
 function scheduleRescan(delay = 600) {
@@ -1617,6 +1625,28 @@ function stubHintForPath(rel) {
   return { label: name, kind, ext };
 }
 
+function applyGraphPatchToData(graphData, patch) {
+  if (!graphData || !patch) return graphData;
+  const nodesById = new Map((graphData.nodes || []).map(n => [n.id, n]));
+  const edgesById = new Map((graphData.edges || []).map(e => [e.id, e]));
+
+  for (const id of patch.nodes?.remove || []) nodesById.delete(id);
+  for (const node of patch.nodes?.add || []) nodesById.set(node.id, node);
+  for (const node of patch.nodes?.update || []) nodesById.set(node.id, node);
+
+  for (const id of patch.edges?.remove || []) edgesById.delete(id);
+  for (const edge of patch.edges?.add || []) edgesById.set(edge.id, edge);
+  for (const edge of patch.edges?.update || []) edgesById.set(edge.id, edge);
+
+  return {
+    ...graphData,
+    nodes: [...nodesById.values()],
+    edges: [...edgesById.values()],
+    fileCount: typeof patch.fileCount === 'number' ? patch.fileCount : graphData.fileCount,
+    elapsedMs: typeof patch.elapsedMs === 'number' ? patch.elapsedMs : graphData.elapsedMs,
+  };
+}
+
 window.tree.onFsEvent((evt) => {
   if (evt.type === 'error') return;
   const rel = evt.path;
@@ -1624,18 +1654,16 @@ window.tree.onFsEvent((evt) => {
   const opMap = { add: 'CREATE', change: 'EDIT', unlink: 'DELETE' };
   const agentMeta = fileWriteSourceMeta();
   state.graphStale = true;
+
   if (evt.type === 'unlink') {
-    // Drop the node + its edges immediately so the graph stays accurate.
     graph.removeFile(rel);
   } else if (evt.type === 'add' && !graph.files.get(rel)) {
-    // Show the new file straight away; full metadata comes in on rescan.
     graph.addFileStub(rel, stubHintForPath(rel));
     graph.touch(rel, 'edit', agentMeta);
   } else if (graph.files.get(rel)) {
     graph.touch(rel, 'edit', agentMeta);
   }
-  if (evt.type === 'add' || evt.type === 'unlink') scheduleRescan(160);
-  else if (evt.type === 'change') scheduleRescan(900);
+
   scheduleFileChromeRefresh(90);
   pushLog(agentMeta.agentId === '__external__' ? 'result' : 'tool', `${agentMeta.label} ${opMap[evt.type] || evt.type.toUpperCase()} ${rel}`);
   pushLedger({
@@ -1644,6 +1672,29 @@ window.tree.onFsEvent((evt) => {
     status: agentMeta.label,
     fileId: graph.files.get(rel) ? rel : null,
   });
+});
+
+window.tree.onGraphPatch((patch) => {
+  if (!patch) return;
+  if (patch.root && state.root && patch.root !== state.root) return;
+  if (!state.graphData) {
+    scheduleRescan(0);
+    return;
+  }
+  if (patch.empty) {
+    state.graphData = {
+      ...state.graphData,
+      fileCount: typeof patch.fileCount === 'number' ? patch.fileCount : state.graphData.fileCount,
+      elapsedMs: typeof patch.elapsedMs === 'number' ? patch.elapsedMs : state.graphData.elapsedMs,
+    };
+    state.graphStale = false;
+    return;
+  }
+  state.graphData = applyGraphPatchToData(state.graphData, patch);
+  state.files = state.graphData.nodes.filter(n => n.type !== 'external');
+  graph.load(state.graphData);
+  refreshFileChrome();
+  state.graphStale = false;
 });
 
 // ===== Resize handles for sidebars =====

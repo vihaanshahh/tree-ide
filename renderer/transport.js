@@ -16,13 +16,9 @@
 //   server → client: { event, data }            (broadcast)
 
 (function () {
-  // Token comes from either window.__TREE_TOKEN__ (injected by the server
-  // into index.html when the request had ?token=…) or, as a last
-  // resort, the current URL's query string.
+  // Token comes from the current URL's query string. The HTTP server avoids
+  // injecting inline script so index.html can keep a strict script-src policy.
   function getToken() {
-    if (typeof window.__TREE_TOKEN__ === 'string' && window.__TREE_TOKEN__) {
-      return window.__TREE_TOKEN__;
-    }
     try {
       const q = new URL(window.location.href).searchParams;
       return q.get('token') || '';
@@ -167,6 +163,7 @@
     onPtyData:        (cb) => on('pty:data', cb),
     onPtyExit:        (cb) => on('pty:exit', cb),
     onFsEvent:        (cb) => on('fs:event', cb),
+    onGraphPatch:     (cb) => on('graph:patch', cb),
     onScanProgress:   (cb) => on('repo:scan-progress', cb),
     onOpenRoot:       (cb) => on('app:open-root', cb),
     onUpdateProgress: (cb) => on('app:update-progress', cb),

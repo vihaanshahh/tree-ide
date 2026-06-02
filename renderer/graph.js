@@ -342,6 +342,11 @@ class Graph {
     this.TABLE_DETAIL_ZOOM = 0.82;        // SQL rows open once zoomed enough to read
     this.TABLE_PREVIEW_ROWS = 7;
     this.debugEdges = false;
+    this.layoutWorker = null;
+    this.layoutWorkerDisabled = false;
+    this.layoutWorkerSeq = 0;
+    this.layoutWorkerFitAfter = new Map();
+    this.WORKER_LAYOUT_THRESHOLD = 420;
 
     this.searchQuery = '';
     this.matchSet = new Set();   // file ids matching
@@ -367,9 +372,130 @@ class Graph {
 
     this.pulses = [];
 
+    this.initLayoutWorker();
     this.setupCanvas();
     this.setupInput();
     this.scheduleFrame();
+  }
+
+  initLayoutWorker() {
+    if (typeof Worker === 'undefined') return;
+    try {
+      this.layoutWorker = new Worker('layout.worker.js');
+      this.layoutWorker.onmessage = (event) => {
+        const msg = event.data || {};
+        if (msg.action !== 'layout-complete') return;
+        if (msg.seq !== this.layoutWorkerSeq) return;
+        if (msg.error) {
+          this.layoutWorkerDisabled = true;
+          this.relayoutSync();
+          return;
+        }
+        const fitAfter = this.layoutWorkerFitAfter.get(msg.seq);
+        this.layoutWorkerFitAfter.delete(msg.seq);
+        this.applyWorkerLayout(msg.result, { fitAfter });
+      };
+      this.layoutWorker.onerror = () => {
+        this.layoutWorkerDisabled = true;
+        this.relayoutSync();
+      };
+    } catch {
+      this.layoutWorker = null;
+      this.layoutWorkerDisabled = true;
+    }
+  }
+
+  layoutNodeSnapshot(f) {
+    return {
+      id: f.id,
+      filename: f.filename,
+      label: f.label,
+      sublabel: f.sublabel,
+      kind: f.kind,
+      dir: f.dir,
+      columns: f.columns,
+      fullPath: f.fullPath,
+      verb: f.verb,
+    };
+  }
+
+  requestWorkerLayout() {
+    if (!this.layoutWorker || this.layoutWorkerDisabled || !this.files.size) return false;
+    const nodes = [...this.files.values()].map(f => this.layoutNodeSnapshot(f));
+    const visibleKinds = [...this.visibleKinds];
+    const matchSet = [...this.matchSet];
+    const visibleCount = nodes.reduce((count, f) => {
+      const forceVisible = this.searchQuery && matchSet.includes(f.id);
+      return count + ((visibleKinds.includes(f.kind) || forceVisible) ? 1 : 0);
+    }, 0);
+    if (visibleCount < this.WORKER_LAYOUT_THRESHOLD) return false;
+
+    const seq = ++this.layoutWorkerSeq;
+    this.visibleNodeCount = visibleCount;
+    this.neighborhoodCache = null;
+    this.layoutWorkerFitAfter.set(seq, !this.layers.length);
+    try {
+      this.layoutWorker.postMessage({
+        action: 'layout',
+        seq,
+        data: {
+          nodes,
+          edges: (this.fileEdges || []).map(e => ({ id: e.id, source: e.source, target: e.target, type: e.type })),
+          opts: {
+            visibleKinds,
+            matchSet,
+            searchQuery: this.searchQuery,
+            expandedTables: [...this.expandedTables],
+            tablePreviewRows: this.TABLE_PREVIEW_ROWS,
+            importance: [...this.importance.entries()],
+            topPad: (this.topOcclusion ? this.topOcclusion() : 80) + 28,
+          },
+        },
+      });
+      return true;
+    } catch {
+      this.layoutWorkerDisabled = true;
+      this.layoutWorkerFitAfter.delete(seq);
+      return false;
+    }
+  }
+
+  applyWorkerLayout(result, { fitAfter = false } = {}) {
+    if (!result || !Array.isArray(result.nodes) || !Array.isArray(result.layers)) return;
+    for (const n of result.nodes) {
+      const f = this.files.get(n.id);
+      if (!f) continue;
+      Object.assign(f, {
+        x: n.x || 0,
+        y: n.y || 0,
+        w: n.w || 110,
+        h: n.h || 24,
+        hidden: !!n.hidden,
+        _visibleCols: n._visibleCols || null,
+        _tableExpanded: !!n._tableExpanded,
+        _showFooter: !!n._showFooter,
+        _moreCount: n._moreCount || 0,
+        _endpointCompact: !!n._endpointCompact,
+        _endpointPath: n._endpointPath || '',
+        _endpointVerb: n._endpointVerb || '',
+        _importance: n._importance || 0,
+        _labelLines: n._labelLines || [this.displayLabel(f)],
+        _mod: n._mod || '',
+      });
+    }
+
+    this.layers = result.layers.map(L => ({
+      ...L,
+      sections: (L.sections || []).map(s => ({
+        ...s,
+        files: (s.fileIds || []).map(id => this.files.get(id)).filter(Boolean),
+      })),
+    }));
+    this.aiNode.x = -99999;
+    this.aiNode.y = -99999;
+    this.refreshVisibleCaches();
+    this.invalidate();
+    if (fitAfter) this.fit();
   }
 
   invalidate() {
@@ -904,6 +1030,11 @@ class Graph {
   }
 
   relayout() {
+    if (this.requestWorkerLayout()) return;
+    this.relayoutSync();
+  }
+
+  relayoutSync() {
     if (!this.files.size) {
       this.visibleFiles = [];
       this.visibleEdges = [];

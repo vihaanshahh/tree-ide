@@ -33,6 +33,9 @@ const SKIP_DIRS = new Set([
 const SKIP_DIR_PREFIXES = ['.venv', 'venv-', 'env-', '.virtualenv'];
 
 const JS_EXTS = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs']);
+const STYLE_EXTS = new Set(['.css', '.scss', '.sass', '.less']);
+const COMPANION_STYLE_SOURCE_EXTS = ['.tsx', '.jsx', '.ts', '.js', '.mjs', '.cjs', '.vue', '.svelte', '.html'];
+const LOCAL_REFERENCE_EXTS = new Set([...CODE_EXT, '.svg', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.ico', '.woff', '.woff2', '.ttf', '.otf']);
 const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'];
 const ANALYSIS_CACHE = new Map();
 const MAX_ROOT_CACHES = 4;
@@ -180,8 +183,7 @@ function loadGitStatus(root) {
   return statusByRel;
 }
 
-function walkRepo(root, opts = {}) {
-  const maxFiles = opts.maxFiles || 5000;
+async function walkRepo(root, opts = {}) {
   const ig = loadIgnore(root);
   const files = [];
 
@@ -191,24 +193,26 @@ function walkRepo(root, opts = {}) {
     return false;
   };
 
-  function walk(dir) {
-    if (files.length >= maxFiles) return;
+  async function walk(dir) {
     let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    try {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
     // Probe for "looks like a Python virtualenv" — presence of pyvenv.cfg or bin/activate
     // is a strong signal we should skip the whole dir even if name doesn't match.
     if (entries.some(e => e.isFile() && (e.name === 'pyvenv.cfg' || e.name === 'activate'))) {
       return;
     }
     for (const e of entries) {
-      if (files.length >= maxFiles) return;
       const full = path.join(dir, e.name);
       const rel = path.relative(root, full);
       if (!rel || rel.startsWith('..')) continue;
       if (e.isDirectory()) {
         if (isSkipDir(e.name)) continue;
         if (ig.ignores(rel + '/')) continue;
-        walk(full);
+        await walk(full);
       } else if (e.isFile()) {
         if (ig.ignores(rel)) continue;
         const ext = path.extname(e.name).toLowerCase();
@@ -216,7 +220,7 @@ function walkRepo(root, opts = {}) {
         let size = 0;
         let mtimeMs = 0;
         try {
-          const st = fs.statSync(full);
+          const st = await fs.promises.stat(full);
           size = st.size;
           mtimeMs = st.mtimeMs;
         } catch {}
@@ -225,7 +229,7 @@ function walkRepo(root, opts = {}) {
       }
     }
   }
-  walk(root);
+  await walk(root);
   return files;
 }
 
@@ -643,12 +647,172 @@ function extractExports(content, ext) {
   return out.slice(0, 30); // cap to avoid runaway
 }
 
+function stripReferenceSuffix(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  return s.split('#')[0].split('?')[0].trim();
+}
+
+function isSkippableReference(raw) {
+  const s = String(raw || '').trim();
+  return !s || s.startsWith('#') || /^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(s);
+}
+
+function normalizeReferenceSource(raw) {
+  if (isSkippableReference(raw)) return null;
+  const stripped = stripReferenceSuffix(raw);
+  return stripped || null;
+}
+
+function referenceExt(raw) {
+  return path.extname(stripReferenceSuffix(raw).toLowerCase());
+}
+
+function looksLikeLocalFileReference(raw) {
+  if (!raw) return false;
+  if (raw.startsWith('.') || raw.startsWith('/')) return true;
+  if (raw.startsWith('@') || raw.startsWith('~')) return false;
+  const ext = referenceExt(raw);
+  return !!ext && LOCAL_REFERENCE_EXTS.has(ext);
+}
+
+function parseAttrs(attrText) {
+  const attrs = new Map();
+  const re = /([A-Za-z_:][A-Za-z0-9_:.:-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/g;
+  let m;
+  while ((m = re.exec(attrText || '')) !== null) {
+    attrs.set(m[1].toLowerCase(), m[2] ?? m[3] ?? m[4] ?? '');
+  }
+  return attrs;
+}
+
+function assetImport(source, reason) {
+  return {
+    source,
+    names: [],
+    local: true,
+    asset: true,
+    reason,
+  };
+}
+
+function extractHtmlReferences(content) {
+  const out = [];
+  const seen = new Set();
+  const add = (raw, reason) => {
+    const source = normalizeReferenceSource(raw);
+    if (!source) return;
+    const key = `${reason}:${source}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(assetImport(source, reason));
+  };
+
+  const tagRe = /<\s*([A-Za-z][A-Za-z0-9:-]*)\b([^>]*)>/g;
+  let m;
+  while ((m = tagRe.exec(content)) !== null) {
+    const tag = m[1].toLowerCase();
+    const attrs = parseAttrs(m[2]);
+    if (tag === 'link') {
+      const href = attrs.get('href');
+      const rel = String(attrs.get('rel') || '').toLowerCase();
+      if (href && /\bstylesheet\b/.test(rel)) add(href, 'stylesheet');
+      else if (href && /\b(?:preload|modulepreload|icon)\b/.test(rel)) add(href, 'asset');
+      continue;
+    }
+    if (tag === 'script') {
+      add(attrs.get('src'), 'script');
+      continue;
+    }
+    if (tag === 'a') {
+      const href = attrs.get('href');
+      if (href && /\.html?([?#]|$)/i.test(href)) add(href, 'asset');
+      continue;
+    }
+    if (['img', 'source', 'video', 'audio', 'iframe', 'embed', 'object'].includes(tag)) {
+      add(attrs.get(tag === 'object' ? 'data' : 'src'), 'asset');
+    }
+  }
+  return out;
+}
+
+function extractCssReferences(content) {
+  const out = [];
+  const seen = new Set();
+  const add = (raw, reason = 'stylesheet') => {
+    const source = normalizeReferenceSource(raw);
+    if (!source) return;
+    const key = `${reason}:${source}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(assetImport(source, reason));
+  };
+
+  let m;
+  const importRe = /@import\s+(?:url\(\s*)?(?:"([^"]+)"|'([^']+)'|([^'")\s;]+))\s*\)?/gi;
+  while ((m = importRe.exec(content)) !== null) add(m[1] || m[2] || m[3], 'stylesheet');
+
+  const sassRe = /@(use|forward)\s+(?:"([^"]+)"|'([^']+)')/gi;
+  while ((m = sassRe.exec(content)) !== null) add(m[2] || m[3], 'stylesheet');
+
+  return out;
+}
+
+function extractAssetReferences(content, ext) {
+  if (ext === '.html') return extractHtmlReferences(content);
+  if (STYLE_EXTS.has(ext)) return extractCssReferences(content);
+  return [];
+}
+
+function findCompanionStyleSources(styleFile, fileByRel) {
+  const dir = path.dirname(styleFile.rel);
+  const inDir = (name) => dir === '.' ? name : `${dir}/${name}`;
+  const base = path.basename(styleFile.rel, styleFile.ext);
+  const stem = base.replace(/\.(?:module|style|styles)$/i, '');
+  const lowerStem = stem.toLowerCase();
+  const candidates = new Set();
+
+  if (stem && !['style', 'styles', 'global', 'globals'].includes(lowerStem)) {
+    for (const ext of COMPANION_STYLE_SOURCE_EXTS) candidates.add(inDir(stem + ext));
+  }
+
+  if (['style', 'styles', 'global', 'globals'].includes(lowerStem)) {
+    for (const name of [
+      'index.html',
+      'index.tsx',
+      'index.jsx',
+      'main.tsx',
+      'main.jsx',
+      'main.ts',
+      'main.js',
+      'app.tsx',
+      'app.jsx',
+      'layout.tsx',
+      'layout.jsx',
+      '_app.tsx',
+      '_app.jsx',
+      'root.tsx',
+      'root.jsx',
+    ]) {
+      candidates.add(inDir(name));
+    }
+  }
+
+  return [...candidates]
+    .map(rel => fileByRel.get(rel))
+    .filter(f => f && f.rel !== styleFile.rel)
+    .map(f => f.rel);
+}
+
 // Returns array of { source, names: string[], local: boolean }
 function extractImportsDetailed(content, ext) {
   const out = [];
   if (!JS_EXTS.has(ext)) {
-    // fall back to source-only
-    return extractImportsSimple(content).map(s => ({ source: s, names: [], local: s.startsWith('.') || s.startsWith('/') }));
+    // fall back to source-only plus HTML/CSS asset references
+    return mergeImports(
+      extractImportsSimple(content).map(s => ({ source: s, names: [], local: s.startsWith('.') || s.startsWith('/') })),
+      extractAssetReferences(content, ext)
+    );
   }
   // import defaultName from "src"
   // import * as ns from "src"
@@ -714,6 +878,16 @@ function tryResolveBase(base, fileIndex) {
   if (/\.mjs$/.test(base))  swappedBases.push(base.replace(/\.mjs$/, '.ts'),  base.replace(/\.mjs$/, '.mts'));
   if (/\.cjs$/.test(base))  swappedBases.push(base.replace(/\.cjs$/, '.ts'),  base.replace(/\.cjs$/, '.cts'));
 
+  const styleBases = [];
+  const baseName = path.basename(base);
+  const baseDir = path.dirname(base);
+  for (const ext of STYLE_EXTS) {
+    styleBases.push(base + ext);
+    if (baseName && !baseName.startsWith('_')) {
+      styleBases.push(path.join(baseDir, '_' + baseName + ext));
+    }
+  }
+
   const candidates = [
     ...swappedBases,
     base,
@@ -721,11 +895,14 @@ function tryResolveBase(base, fileIndex) {
     base + '.mjs', base + '.cjs', base + '.mts', base + '.cts',
     base + '.vue', base + '.svelte',
     base + '.py', base + '.go', base + '.rs',
+    ...styleBases,
     path.join(base, 'index.ts'),
     path.join(base, 'index.tsx'),
     path.join(base, 'index.js'),
     path.join(base, 'index.jsx'),
     path.join(base, 'index.mjs'),
+    path.join(base, 'index.css'),
+    path.join(base, 'index.scss'),
     path.join(base, '__init__.py'),
   ];
   for (const c of candidates) {
@@ -736,12 +913,21 @@ function tryResolveBase(base, fileIndex) {
 }
 
 function resolveLocalImport(fromFile, importStr, fileIndex, root, aliasCfg) {
+  importStr = normalizeReferenceSource(importStr);
   if (!importStr) return null;
   // Relative or absolute paths
   if (importStr.startsWith('.') || importStr.startsWith('/')) {
     const fromDir = path.dirname(fromFile.full);
     const base = importStr.startsWith('/') ? importStr : path.resolve(fromDir, importStr);
     return tryResolveBase(base, fileIndex);
+  }
+
+  // HTML/CSS references often use `styles.css` instead of `./styles.css`.
+  // Treat file-like bare specifiers as relative first; package imports still
+  // fall through to alias/baseUrl/external handling.
+  if (looksLikeLocalFileReference(importStr)) {
+    const hit = tryResolveBase(path.resolve(path.dirname(fromFile.full), importStr), fileIndex);
+    if (hit) return hit;
   }
 
   // Path aliases (tsconfig paths)
@@ -991,6 +1177,67 @@ function classifySqlOps(body, varName) {
   };
 }
 
+let analyzeASTImpl = null;
+let analyzeASTLoadFailed = false;
+
+function analyzeASTSafe(ext, content) {
+  if (process.versions && process.versions.electron && process.env.TREE_IDE_ENABLE_ELECTRON_TREE_SITTER !== '1') {
+    return null;
+  }
+  if (analyzeASTLoadFailed) return null;
+  if (!analyzeASTImpl) {
+    try {
+      ({ analyzeAST: analyzeASTImpl } = require('./parser'));
+    } catch {
+      analyzeASTLoadFailed = true;
+      return null;
+    }
+  }
+  return analyzeASTImpl(ext, content);
+}
+
+function mergeExports(primary = [], secondary = []) {
+  const out = [];
+  const seen = new Set();
+  const add = (e) => {
+    if (!e || !e.name) return;
+    const key = e.name;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(e);
+  };
+  for (const e of primary || []) add(e);
+  for (const e of secondary || []) add(e);
+  return out.slice(0, 40);
+}
+
+function mergeImports(primary = [], secondary = []) {
+  const bySource = new Map();
+  const add = (imp) => {
+    if (!imp || !imp.source) return;
+    const reason = imp.reason || null;
+    const key = `${imp.source}\0${reason || ''}`;
+    const prev = bySource.get(key);
+    if (!prev) {
+      bySource.set(key, {
+        source: imp.source,
+        names: [...new Set(imp.names || [])],
+        local: !!imp.local,
+        asset: !!imp.asset,
+        reason,
+      });
+      return;
+    }
+    prev.local = prev.local || !!imp.local;
+    prev.asset = prev.asset || !!imp.asset;
+    prev.reason = prev.reason || reason;
+    prev.names = [...new Set([...(prev.names || []), ...(imp.names || [])])];
+  };
+  for (const imp of primary || []) add(imp);
+  for (const imp of secondary || []) add(imp);
+  return [...bySource.values()];
+}
+
 async function buildGraph(root, opts = {}) {
   const t0 = Date.now();
   const includeFnEdges = !!opts.includeFnEdges;
@@ -998,9 +1245,13 @@ async function buildGraph(root, opts = {}) {
   const fsP = require('fs').promises;
   const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
 
-  const files = walkRepo(root);
+  const files = await walkRepo(root);
   const fileIndex = new Map();
-  for (const f of files) fileIndex.set(f.full, f);
+  const fileByRel = new Map();
+  for (const f of files) {
+    fileIndex.set(f.full, f);
+    fileByRel.set(f.rel, f);
+  }
   const aliasCfg = loadPathAliases(root);
   const gitStatusByRel = loadGitStatus(root);
 
@@ -1064,9 +1315,11 @@ async function buildGraph(root, opts = {}) {
       try { content = await fsP.readFile(f.full, 'utf8'); } catch { content = ''; }
       if (content.length > 200_000) content = content.slice(0, 200_000);
 
+      let ast = null;
+      try { ast = analyzeASTSafe(f.ext, content); } catch {}
       const semantic = detectSemantic(f.rel, content, fwForRel(f.rel));
-      const exports = extractExports(content, f.ext);
-      const importsDetailed = extractImportsDetailed(content, f.ext);
+      const exports = mergeExports(extractExports(content, f.ext), ast && ast.exports);
+      const importsDetailed = mergeImports(extractImportsDetailed(content, f.ext), ast && ast.imports);
       const SOURCE_EXTS = new Set(['.js','.jsx','.ts','.tsx','.mjs','.cjs','.py','.go','.rb','.php','.java','.kt','.swift','.vue','.svelte','.html']);
       const apiCalls = SOURCE_EXTS.has(f.ext) ? extractApiCalls(content) : null;
       const mountDecls = extractMountDecls(content);
@@ -1148,18 +1401,24 @@ async function buildGraph(root, opts = {}) {
   const fnEdges = [];
   const fnEdgeSet = new Set();
   const externalSet = new Set();
+  const addFileEdge = (source, target, type = 'import', extra = {}) => {
+    if (!source || !target || source === target) return false;
+    const key = source + '→' + target;
+    if (fileEdgeSet.has(key)) return false;
+    fileEdgeSet.add(key);
+    fileEdges.push({ id: key, source, target, type, ...extra });
+    return true;
+  };
 
   for (const f of files) {
     const meta = fileMeta.get(f.rel);
     if (!meta) continue;
     for (const imp of meta.importsDetailed) {
-      const target = resolveLocalImport(f, imp.source, fileIndex, root, aliasCfg);
+      const source = normalizeReferenceSource(imp.source);
+      if (!source) continue;
+      const target = resolveLocalImport(f, source, fileIndex, root, aliasCfg);
       if (target && target !== f.rel) {
-        const key = f.rel + '→' + target;
-        if (!fileEdgeSet.has(key)) {
-          fileEdgeSet.add(key);
-          fileEdges.push({ id: key, source: f.rel, target, type: 'import' });
-        }
+        addFileEdge(f.rel, target, 'import', imp.reason ? { reason: imp.reason } : {});
         // Function-level edges (only if explicitly requested; expensive)
         if (includeFnEdges && imp.names.length && meta.exports.length && meta.content) {
           const exportSpans = computeExportSpans(meta.content, meta.exports);
@@ -1181,15 +1440,18 @@ async function buildGraph(root, opts = {}) {
             }
           }
         }
-      } else if (!target) {
-        const extId = 'ext:' + imp.source.split('/')[0];
+      } else if (!target && !imp.asset) {
+        const extId = 'ext:' + source.split('/')[0];
         externalSet.add(extId);
-        const key = f.rel + '→' + extId;
-        if (!fileEdgeSet.has(key)) {
-          fileEdgeSet.add(key);
-          fileEdges.push({ id: key, source: f.rel, target: extId, type: 'external' });
-        }
+        addFileEdge(f.rel, extId, 'external');
       }
+    }
+  }
+
+  for (const f of files) {
+    if (!STYLE_EXTS.has(f.ext)) continue;
+    for (const sourceRel of findCompanionStyleSources(f, fileByRel)) {
+      addFileEdge(sourceRel, f.rel, 'import', { reason: 'companion-style' });
     }
   }
 
