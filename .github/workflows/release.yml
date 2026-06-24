@@ -8,6 +8,14 @@ on:
 permissions:
   contents: write
 
+# Code-signing / notarization are OPTIONAL. When these repo secrets are set the
+# mac builds are signed + notarized (which is what makes in-app auto-update work
+# on macOS); when they are absent the builds are still produced, just unsigned.
+#   MAC_CSC_LINK                 base64 of the Developer ID .p12
+#   MAC_CSC_KEY_PASSWORD         password for that .p12
+#   APPLE_ID                     Apple Developer account email
+#   APPLE_APP_SPECIFIC_PASSWORD  app-specific password from appleid.apple.com
+#   APPLE_TEAM_ID                10-char Team ID
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -48,7 +56,19 @@ jobs:
   build-mac:
     needs: check
     if: needs.check.outputs.should_release == 'true'
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13   # Intel runner → correct x86_64 native modules
+            arch: x64
+          - runner: macos-14   # Apple Silicon runner → correct arm64 native modules
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      # When MAC_CSC_LINK is empty, auto-discovery stays off and the build is
+      # simply unsigned. When it's set, CSC_LINK turns signing on.
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
     steps:
       - uses: actions/checkout@v4
 
@@ -56,30 +76,44 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install deps
+      - name: Install deps (rebuilds native modules for ${{ matrix.arch }})
         run: npm ci
 
-      - name: Build (mac arm64 + x64 dmgs)
-        run: npm run dist
+      - name: Build ${{ matrix.arch }} (dmg + zip)
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          npm run build:icon
+          npx electron-builder --mac dmg zip --${{ matrix.arch }} --publish never
 
-      - name: Create version-less aliases
+      - name: Stage artifacts (versionless dmg alias + arch-tagged update metadata)
         working-directory: dist
         env:
           V: ${{ needs.check.outputs.version }}
+          A: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          cp "Tree-${V}-arm64.dmg" "Tree-arm64.dmg"
-          cp "Tree-${V}.dmg"        "Tree-x64.dmg"
-          ls -la *.dmg
+          if [ "$A" = "arm64" ]; then
+            cp "Tree-${V}-arm64.dmg" "Tree-arm64.dmg"
+          else
+            cp "Tree-${V}.dmg" "Tree-x64.dmg"
+          fi
+          # Rename so the two arch jobs don't collide; merged back in the release job.
+          cp latest-mac.yml "latest-mac-${A}.yml"
+          ls -la
 
       - uses: actions/upload-artifact@v4
         with:
-          name: mac
+          name: mac-${{ matrix.arch }}
           path: |
-            dist/Tree-*-arm64.dmg
-            dist/Tree-*.dmg
-            dist/Tree-arm64.dmg
-            dist/Tree-x64.dmg
+            dist/*.dmg
+            dist/*-mac.zip
+            dist/*.blockmap
+            dist/latest-mac-${{ matrix.arch }}.yml
           if-no-files-found: error
 
   build-win:
@@ -114,6 +148,8 @@ jobs:
           path: |
             dist/Tree-Setup-*.exe
             dist/Tree-Setup.exe
+            dist/*.blockmap
+            dist/latest.yml
           if-no-files-found: error
 
   release:
@@ -121,13 +157,24 @@ jobs:
     if: needs.check.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
 
-      - name: List artifacts
-        run: ls -la artifacts/
+      - name: Merge per-arch mac update metadata
+        run: |
+          set -euo pipefail
+          npm i js-yaml@4 --no-save --no-audit --no-fund
+          node scripts/merge-mac-latest-yml.js artifacts
+          echo "=== release assets ==="
+          ls -la artifacts/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -137,4 +184,8 @@ jobs:
           name: "Tree IDE ${{ needs.check.outputs.tag }}"
           files: |
             artifacts/Tree-*.dmg
+            artifacts/Tree-*-mac.zip
             artifacts/Tree-Setup*.exe
+            artifacts/*.blockmap
+            artifacts/latest-mac.yml
+            artifacts/latest.yml

@@ -23,6 +23,11 @@ const { Backend, normalizeOpenRoot, compareVersions, fetchLatestRelease } = requ
 const { startServer } = require('./src/server');
 const pkg = require('./package.json');
 
+// electron-updater is optional — required lazily so unsigned/dev builds and
+// the headless server keep working even if it isn't installed.
+let autoUpdater = null;
+try { ({ autoUpdater } = require('electron-updater')); } catch { /* optional */ }
+
 const UPDATE_REPO = 'vihaanshahh/tree-ide';
 
 // =======================================================================
@@ -177,6 +182,23 @@ if (gotSingleInstanceLock) {
 // Wired into Backend so the renderer can invoke them transparently
 // (folder picker, self-update via git pull) over the same WS channel.
 // =======================================================================
+// Wire electron-updater download/install events to the renderer's update
+// progress UI. Only meaningful in a packaged, signed build; a no-op otherwise.
+let autoUpdaterReady = false;
+function setupAutoUpdater() {
+  if (!autoUpdater || !app.isPackaged || autoUpdaterReady) return;
+  autoUpdaterReady = true;
+  autoUpdater.autoDownload = false;          // download only when the user clicks
+  autoUpdater.autoInstallOnAppQuit = true;
+  const emit = (payload) => { try { backend?.events.emit('app:update-progress', payload); } catch {} };
+  autoUpdater.on('download-progress', (p) => emit({ status: 'downloading', percent: Math.round(p.percent || 0) }));
+  autoUpdater.on('update-downloaded', () => {
+    emit({ status: 'relaunching' });
+    setImmediate(() => { try { autoUpdater.quitAndInstall(); } catch {} });
+  });
+  autoUpdater.on('error', (err) => emit({ status: 'error', error: String(err?.message || err) }));
+}
+
 function buildElectronHooks() {
   return {
     openFolder: async () => {
@@ -203,9 +225,27 @@ function buildElectronHooks() {
     relaunch: () => { app.relaunch(); app.exit(0); },
 
     updateAndRelaunch: async () => {
+      // Packaged app: download + apply via electron-updater (background download,
+      // then quit-and-install on relaunch). Requires a signed build on macOS.
       if (!isGitCheckout()) {
-        try { await shell.openExternal(`https://github.com/${UPDATE_REPO}/releases/latest`); } catch {}
-        return { error: 'Not a git checkout — opened the releases page so you can grab the new build.' };
+        if (!autoUpdater || !app.isPackaged) {
+          try { await shell.openExternal(`https://github.com/${UPDATE_REPO}/releases/latest`); } catch {}
+          return { error: 'In-app update unavailable in this build — opened the releases page.' };
+        }
+        try {
+          setupAutoUpdater();
+          backend.events.emit('app:update-progress', { status: 'fetching' });
+          const result = await autoUpdater.checkForUpdates();
+          if (!result || !result.updateInfo) return { error: 'No update metadata found on the release.' };
+          backend.events.emit('app:update-progress', { status: 'downloading', percent: 0 });
+          await autoUpdater.downloadUpdate();   // 'update-downloaded' triggers quitAndInstall
+          return { ok: true };
+        } catch (e) {
+          backend.events.emit('app:update-progress', { status: 'error', error: String(e?.message || e) });
+          // Fall back to the releases page so the user can still grab the build.
+          try { await shell.openExternal(`https://github.com/${UPDATE_REPO}/releases/latest`); } catch {}
+          return { error: e?.message || String(e) };
+        }
       }
       const run = (cmd, args) => new Promise((resolve, reject) => {
         const child = spawn(cmd, args, { cwd: __dirname, env: process.env });
@@ -449,6 +489,7 @@ if (gotSingleInstanceLock) app.whenReady().then(async () => {
     try { app.dock.setIcon(getAppIcon()); } catch {}
   }
   await boot();
+  setupAutoUpdater();
   createWindow();
   const isMac = process.platform === 'darwin';
   const template = [
