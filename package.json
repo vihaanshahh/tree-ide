@@ -1,7 +1,7 @@
 {
   "name": "tree-ide",
   "productName": "Tree",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Tree — a graph-first IDE (long: Tree IDE) that maps any repo into a live blueprint and runs agents alongside it.",
   "main": "main.js",
   "type": "commonjs",
@@ -19,8 +19,8 @@
     "postinstall": "node ./scripts/postinstall.js",
     "build:icon": "node scripts/build-icns.js",
     "dist": "npm run build:icon && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg zip --arm64 --x64 --publish never",
-    "dist:arm64": "npm run build:icon && electron-builder --mac dmg zip --arm64 --publish never",
-    "dist:x64": "npm run build:icon && electron-builder --mac dmg zip --x64 --publish never",
+    "dist:arm64": "npm run build:icon && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg zip --arm64 --publish never",
+    "dist:x64": "npm run build:icon && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg zip --x64 --publish never",
     "dist:universal": "npm run build:icon && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg zip --universal --publish never",
     "dist:win": "npm run build:icon && electron-builder --win nsis --x64 --publish never"
   },

@@ -2,6 +2,17 @@
 
 All notable changes to Tree IDE.
 
+## [0.4.2] - 2026-06-24
+
+### Added
+
+- **Multi-window.** Open multiple windows, each mapping a different repo on the
+  same machine. Every window runs its own backend + embedded server, so repos
+  stay fully isolated (separate file tree, terminals, and watchers). New menu
+  items: File → New Window (Cmd/Ctrl+N) and Open Repo in New Window…
+  (Cmd/Ctrl+Shift+N). A second `tree-ide --open <repo>` invocation now opens a
+  new window for that repo instead of focusing the existing one.
+
 ## [0.3.1] - 2026-06-01
 
 ### Added
