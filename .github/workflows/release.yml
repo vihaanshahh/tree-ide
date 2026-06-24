@@ -65,10 +65,6 @@ jobs:
           - runner: macos-14   # Apple Silicon runner → correct arm64 native modules
             arch: arm64
     runs-on: ${{ matrix.runner }}
-    env:
-      # When MAC_CSC_LINK is empty, auto-discovery stays off and the build is
-      # simply unsigned. When it's set, CSC_LINK turns signing on.
-      CSC_IDENTITY_AUTO_DISCOVERY: "false"
     steps:
       - uses: actions/checkout@v4
 
@@ -81,13 +77,24 @@ jobs:
 
       - name: Build ${{ matrix.arch }} (dmg + zip)
         env:
-          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          # Mapped under MAC_* so electron-builder doesn't pick up an empty
+          # CSC_LINK (an empty string makes it look for a cert file and fail).
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          set -euo pipefail
           npm run build:icon
+          if [ -n "${MAC_CSC_LINK:-}" ]; then
+            echo "Developer ID cert present — building signed."
+            export CSC_LINK="$MAC_CSC_LINK"
+            export CSC_KEY_PASSWORD="${MAC_CSC_KEY_PASSWORD:-}"
+          else
+            echo "No signing cert — building unsigned (arch-correct)."
+            export CSC_IDENTITY_AUTO_DISCOVERY=false
+          fi
           npx electron-builder --mac dmg zip --${{ matrix.arch }} --publish never
 
       - name: Stage artifacts (versionless dmg alias + arch-tagged update metadata)
