@@ -1,7 +1,7 @@
 {
   "name": "tree-ide",
   "productName": "Tree",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Tree — a graph-first IDE (long: Tree IDE) that maps any repo into a live blueprint and runs agents alongside it.",
   "main": "main.js",
   "type": "commonjs",
@@ -18,16 +18,24 @@
     "test:renderer": "electron --disable-gpu --no-sandbox tests/renderer-smoke.js",
     "postinstall": "node ./scripts/postinstall.js",
     "build:icon": "node scripts/build-icns.js",
-    "dist": "npm run build:icon && electron-builder --mac dmg --arm64 --x64 --publish never",
-    "dist:arm64": "npm run build:icon && electron-builder --mac dmg --arm64 --publish never",
-    "dist:x64": "npm run build:icon && electron-builder --mac dmg --x64 --publish never",
-    "dist:universal": "npm run build:icon && electron-builder --mac dmg --universal --publish never",
+    "dist": "npm run build:icon && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg zip --arm64 --x64 --publish never",
+    "dist:arm64": "npm run build:icon && electron-builder --mac dmg zip --arm64 --publish never",
+    "dist:x64": "npm run build:icon && electron-builder --mac dmg zip --x64 --publish never",
+    "dist:universal": "npm run build:icon && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg zip --universal --publish never",
     "dist:win": "npm run build:icon && electron-builder --win nsis --x64 --publish never"
   },
   "build": {
     "appId": "ai.fluidstate.tree",
     "productName": "Tree",
     "copyright": "Copyright © 2026 Vihaan Shah",
+    "afterSign": "scripts/notarize.js",
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "vihaanshahh",
+        "repo": "tree-ide"
+      }
+    ],
     "directories": {
       "output": "dist",
       "buildResources": "build"
@@ -58,11 +66,20 @@
             "arm64",
             "x64"
           ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
         }
       ],
-      "identity": null,
-      "hardenedRuntime": false,
-      "gatekeeperAssess": false
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "notarize": false
     },
     "dmg": {
       "title": "Tree ${version}",
@@ -114,9 +131,11 @@
     "tree-sitter-python": "^0.25.0",
     "tree-sitter-rust": "^0.24.0",
     "tree-sitter-typescript": "^0.23.2",
-    "ws": "^8.20.1"
+    "ws": "^8.20.1",
+    "electron-updater": "^6.3.9"
   },
   "devDependencies": {
+    "@electron/notarize": "^2.5.0",
     "@electron/rebuild": "^4.0.4",
     "electron": "^33.0.0",
     "electron-builder": "^26.8.1"

@@ -1786,7 +1786,7 @@ async function checkForUpdate() {
 updateBtn?.addEventListener('click', async () => {
   if (!updateInfo || !window.tree?.updateAndRelaunch) return;
   updateBtn.disabled = true;
-  updateBtnLabel.textContent = updateInfo.gitCheckout ? 'Updating…' : 'Opening…';
+  updateBtnLabel.textContent = 'Updating…';
   const result = await window.tree.updateAndRelaunch();
   if (result && result.error) {
     updateBtnLabel.textContent = `Update failed`;
@@ -1798,7 +1798,16 @@ updateBtn?.addEventListener('click', async () => {
 window.tree?.onUpdateProgress?.((evt) => {
   if (!updateBtn || !updateBtnLabel) return;
   const map = { fetching: 'Fetching…', pulling: 'Pulling…', installing: 'Installing…', relaunching: 'Relaunching…' };
-  if (map[evt?.status]) updateBtnLabel.textContent = map[evt.status];
+  if (evt?.status === 'downloading') {
+    const pct = Number.isFinite(evt.percent) ? evt.percent : 0;
+    updateBtnLabel.textContent = `Downloading ${pct}%`;
+  } else if (evt?.status === 'error') {
+    updateBtnLabel.textContent = 'Update failed';
+    if (evt.error) updateBtn.title = evt.error;
+    updateBtn.disabled = false;
+  } else if (map[evt?.status]) {
+    updateBtnLabel.textContent = map[evt.status];
+  }
 });
 
 // Initial check shortly after launch, then every 30 minutes while open.
