@@ -198,12 +198,10 @@ const FONT_DISPLAY = '"NB Akademie", "Montserrat", ui-sans-serif, system-ui, san
 // ============================================================
 // Module-based layout helpers.
 //
-// The diagram is a MAP: each top-level folder is a panel, panels
-// stack into tier rows by import depth (entries on top, primitives
-// on bottom), and within each row modules are ordered by barycenter
-// so cross-module edges read top-to-bottom instead of crisscrossing.
-// Within a panel, files are bucketed by kind into small sections,
-// reusing the existing pill bin-packing.
+// The diagram is a MAP: each top-level folder is a panel, then those
+// panels are packed like a picture/contact sheet so large repos do not
+// become one long strip. Within a panel, files are bucketed by kind into
+// small sections, reusing the existing pill bin-packing.
 // ============================================================
 function moduleKeyOf(f, depth) {
   const raw = f.dir || (f.id && f.id.includes('/') ? f.id.slice(0, f.id.lastIndexOf('/')) : '');
@@ -248,6 +246,103 @@ function moduleDisplayName(key) {
   return key;
 }
 
+function focusModuleKeyOf(f, focusId) {
+  if (!f) return '5:support';
+  if (f.id === focusId) return '0:selected';
+  if (['page', 'layout', 'template', 'component', 'hook', 'store', 'styles'].includes(f.kind)) return '1:components';
+  if (['endpoint', 'route', 'service', 'server-action', 'middleware', 'job'].includes(f.kind)) return '2:functional';
+  if (['table', 'schema', 'model'].includes(f.kind)) return '3:data';
+  if (f.kind === 'external') return '4:external';
+  return '5:support';
+}
+
+function focusModuleDisplayName(key) {
+  return {
+    '0:selected': 'SELECTED',
+    '1:components': 'COMPONENTS',
+    '2:functional': 'FUNCTIONAL',
+    '3:data': 'DATA',
+    '4:external': 'EXTERNAL',
+    '5:support': 'SUPPORT',
+  }[key] || moduleDisplayName(key);
+}
+
+function fileBaseName(f) {
+  return String((f && (f.filename || f.id)) || '').split('/').pop().replace(/\.[^.]+$/, '');
+}
+
+function featureContextKey(f) {
+  if (!f) return '';
+  const parts = String(f.id || '').split('/').filter(Boolean);
+  const appIdx = parts.lastIndexOf('app');
+  if (appIdx !== -1) {
+    const routeParts = parts.slice(appIdx + 1, -1)
+      .filter(part => part && !/^\(.+\)$/.test(part))
+      .filter(part => !['components', 'component', '_components', 'ui', 'lib', 'utils', 'hooks'].includes(part));
+    if (routeParts.length) return `route:${routeParts.slice(-2).join('/')}`;
+  }
+  const dirParts = String(f.dir || '').split('/').filter(Boolean);
+  if (!dirParts.length) return '';
+  return `dir:${dirParts.slice(0, Math.min(3, dirParts.length)).join('/')}`;
+}
+
+function tokenSetForFile(f) {
+  const stop = new Set([
+    'app', 'src', 'lib', 'utils', 'util', 'components', 'component', '_components', 'ui',
+    'page', 'layout', 'route', 'index', 'main', 'server', 'client', 'tsx', 'ts', 'jsx', 'js',
+  ]);
+  const raw = `${f && f.id || ''} ${f && f.sublabel || ''} ${fileBaseName(f)}`;
+  const tokens = String(raw)
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(t => t.length > 2 && !stop.has(t));
+  return new Set(tokens);
+}
+
+function contextRelation(a, b) {
+  if (!a || !b || a.id === b.id) return null;
+  if (a.dir && b.dir && a.dir === b.dir) return { score: 96, reason: 'same folder' };
+
+  const aDir = String(a.dir || '');
+  const bDir = String(b.dir || '');
+  const parentChild = aDir && bDir && (
+    aDir.startsWith(bDir + '/') ||
+    bDir.startsWith(aDir + '/')
+  );
+  const depthDelta = Math.abs(aDir.split('/').length - bDir.split('/').length);
+  if (parentChild && depthDelta <= 2) return { score: 70, reason: 'near folder' };
+
+  const aCtx = featureContextKey(a);
+  const bCtx = featureContextKey(b);
+  if (aCtx && aCtx === bCtx) return { score: 78, reason: 'same feature' };
+
+  const aTokens = tokenSetForFile(a);
+  const bTokens = tokenSetForFile(b);
+  let overlap = 0;
+  for (const t of aTokens) if (bTokens.has(t)) overlap++;
+  if (overlap >= 2) return { score: Math.min(74, 34 + overlap * 14), reason: 'name match' };
+  if (overlap === 1 && (a.kind === b.kind || aCtx === bCtx)) return { score: 44, reason: 'near name' };
+  return null;
+}
+
+function architectClusterLabel(f, focus) {
+  if (!f) return 'other';
+  if (focus && f.id === focus.id) return 'selected';
+  const ctx = featureContextKey(f);
+  if (ctx && ctx.startsWith('route:')) return ctx.slice(6);
+  const parts = String(f.dir || '').split('/').filter(Boolean);
+  if (!parts.length) return fileBaseName(f);
+  const appIdx = parts.lastIndexOf('app');
+  if (appIdx !== -1) {
+    const routeParts = parts.slice(appIdx + 1)
+      .filter(part => part && !/^\(.+\)$/.test(part))
+      .filter(part => !['components', 'component', '_components', 'ui', 'lib', 'utils', 'hooks'].includes(part));
+    if (routeParts.length) return routeParts.slice(-2).join('/');
+  }
+  return parts.slice(-2).join('/');
+}
+
 // Build the module adjacency from file-level edges (only counts
 // crossings between different modules). Returns:
 //   out: Map<modA, Map<modB, weight>>  (A → B)
@@ -264,7 +359,7 @@ function buildModuleAdjacency(fileEdges, filesMap, modOf, moduleIds) {
     const a = modOf(sf), b = modOf(tf);
     if (a === b || !moduleIds.has(a) || !moduleIds.has(b)) continue;
     const inner = out.get(a);
-    inner.set(b, (inner.get(b) || 0) + 1);
+    inner.set(b, (inner.get(b) || 0) + edgeTypeWeight(e));
     und.get(a).add(b);
     und.get(b).add(a);
   }
@@ -295,6 +390,162 @@ function computeModuleTiers(out, moduleIds) {
   return tier;
 }
 
+function edgeTypeWeight(e) {
+  if (!e) return 1;
+  if (e.isDbQuery || e.type === 'db-query') return 7;
+  if (e.isApiCall || e.type === 'api-call') return 6;
+  if (e.isEndpointInternal || e.type === 'endpoint-internal') return 4;
+  if (e.isFk || e.type === 'fk') return 3;
+  if (e.type === 'import') return e.isTransitive ? 0.35 : 1;
+  return e.isTransitive ? 0.25 : 1;
+}
+
+function baseFeatureScore(f, { matchSet, activeFileIds } = {}) {
+  let score = 0;
+  if (f.gitStatus && f.gitStatus.dirty) score += f.gitStatus.untracked ? 12 : 16;
+  if (activeFileIds && activeFileIds.has(f.id)) score += 18;
+  if (matchSet && matchSet.has(f.id)) score += 14;
+  return score;
+}
+
+function computeFeatureScores(files, edges, opts = {}) {
+  const filesMap = files instanceof Map ? files : new Map(files.map(f => [f.id, f]));
+  const base = new Map();
+  for (const f of filesMap.values()) {
+    const score = baseFeatureScore(f, opts);
+    if (score) base.set(f.id, score);
+  }
+  const scores = new Map(base);
+  for (const e of edges || []) {
+    const sf = filesMap.get(e.source);
+    const tf = filesMap.get(e.target);
+    if (!sf || !tf || sf.hidden || tf.hidden) continue;
+    const w = edgeTypeWeight(e);
+    const sourceScore = base.get(e.source) || 0;
+    const targetScore = base.get(e.target) || 0;
+    if (sourceScore) scores.set(e.target, (scores.get(e.target) || 0) + sourceScore * w * 0.16);
+    if (targetScore) scores.set(e.source, (scores.get(e.source) || 0) + targetScore * w * 0.12);
+  }
+  return scores;
+}
+
+function modulePairWeight(out, a, b) {
+  if (!out || !a || !b || a === b) return 0;
+  return (out.get(a)?.get(b) || 0) + (out.get(b)?.get(a) || 0);
+}
+
+function orderModulesByFeatureFlow(modules, out) {
+  if (modules.length <= 2) return modules.slice();
+  const remaining = new Map(modules.map(mod => [mod.id, mod]));
+  const ordered = [];
+  const moduleRank = (mod) => (
+    (mod._featureScore || 0) * 7 +
+    (mod._componentScore || 0) * 2.2 +
+    Math.log2((mod._score || 0) + 1) * 10 +
+    mod.files.length * 0.35
+  );
+  const pickBest = (scoreFor) => {
+    let best = null;
+    let bestScore = -Infinity;
+    for (const mod of remaining.values()) {
+      const score = scoreFor(mod);
+      if (score > bestScore || (score === bestScore && best && mod.id.localeCompare(best.id) < 0)) {
+        best = mod;
+        bestScore = score;
+      }
+    }
+    if (best) remaining.delete(best.id);
+    return best;
+  };
+
+  const first = pickBest(moduleRank);
+  if (first) ordered.push(first);
+
+  while (remaining.size) {
+    const last = ordered[ordered.length - 1];
+    const next = pickBest((mod) => {
+      let placedConnection = 0;
+      for (const placed of ordered) placedConnection += modulePairWeight(out, mod.id, placed.id);
+      const lastConnection = last ? modulePairWeight(out, mod.id, last.id) : 0;
+      const tierDistance = last ? Math.abs((mod._tier || 0) - (last._tier || 0)) : 0;
+      return placedConnection * 54 + lastConnection * 32 + moduleRank(mod) - tierDistance * 0.7;
+    });
+    if (next) ordered.push(next);
+  }
+  return ordered;
+}
+
+function isFunctionalEdge(e, a, b) {
+  if (!a || !b || !e) return false;
+  if (e.isApiCall || e.isDbQuery || e.isEndpointInternal) return true;
+  const uiKinds = new Set(['page', 'component', 'hook', 'store', 'layout', 'template']);
+  const serverKinds = new Set(['endpoint', 'route', 'service', 'server-action', 'middleware', 'job']);
+  const dataKinds = new Set(['table', 'schema', 'model']);
+  return (
+    (uiKinds.has(a.kind) && (serverKinds.has(b.kind) || dataKinds.has(b.kind))) ||
+    (uiKinds.has(b.kind) && (serverKinds.has(a.kind) || dataKinds.has(a.kind))) ||
+    (serverKinds.has(a.kind) && dataKinds.has(b.kind)) ||
+    (serverKinds.has(b.kind) && dataKinds.has(a.kind))
+  );
+}
+
+function packModulePicture(modules, { xGap, yGap, topPad, targetAspect = 1.08, translate }) {
+  if (!modules.length) return;
+  if (modules.length === 1) {
+    translate(modules[0], 0, topPad);
+    return;
+  }
+
+  const totalArea = modules.reduce((sum, mod) => {
+    return sum + (mod._panelW + xGap) * (mod._panelH + yGap);
+  }, 0);
+  const maxPanelW = Math.max(...modules.map(mod => mod._panelW));
+  const naturalW = Math.sqrt(Math.max(1, totalArea) * targetAspect);
+  const minTargetW = Math.max(maxPanelW, naturalW * 0.68);
+  const maxTargetW = Math.max(minTargetW, naturalW * 1.42);
+  let best = null;
+
+  const packAtWidth = (targetW) => {
+    const rows = [];
+    let row = { mods: [], w: 0, h: 0 };
+    for (const mod of modules) {
+      const nextW = row.mods.length ? row.w + xGap + mod._panelW : mod._panelW;
+      if (row.mods.length && nextW > targetW) {
+        rows.push(row);
+        row = { mods: [], w: 0, h: 0 };
+      }
+      row.mods.push(mod);
+      row.w = row.mods.length === 1 ? mod._panelW : nextW;
+      row.h = Math.max(row.h, mod._panelH);
+    }
+    if (row.mods.length) rows.push(row);
+    const w = Math.max(...rows.map(r => r.w));
+    const h = rows.reduce((sum, r) => sum + r.h, 0) + yGap * Math.max(0, rows.length - 1);
+    const aspect = w / Math.max(1, h);
+    const aspectPenalty = Math.abs(Math.log(aspect / targetAspect));
+    const lonelyRows = rows.filter(r => r.mods.length === 1).length;
+    const rowPenalty = Math.abs(rows.length - Math.sqrt(modules.length)) * 0.035;
+    const lonelyPenalty = lonelyRows / modules.length * 0.22;
+    return { rows, w, h, score: aspectPenalty + rowPenalty + lonelyPenalty };
+  };
+
+  for (let i = 0; i < 18; i++) {
+    const t = i / 17;
+    const candidate = packAtWidth(minTargetW + (maxTargetW - minTargetW) * t);
+    if (!best || candidate.score < best.score) best = candidate;
+  }
+
+  let y = topPad;
+  for (const row of best.rows) {
+    let x = -row.w / 2;
+    for (const mod of row.mods) {
+      translate(mod, x, y);
+      x += mod._panelW + xGap;
+    }
+    y += row.h + yGap;
+  }
+}
+
 class Graph {
   constructor(canvas) {
     this.canvas = canvas;
@@ -308,6 +559,8 @@ class Graph {
     this.hitFiles = [];         // positioned files in draw order, reused for hit-testing
     this.fileEdges = [];        // import edges (file → file or file → ext id)
     this.fnEdges = [];
+    this.fnEdgesBySourceFile = new Map();
+    this.fnEdgesByTargetFile = new Map();
     this.edgesBySource = new Map();
     this.edgesByTarget = new Map();
     this.flowEdgesBySource = new Map();
@@ -331,7 +584,7 @@ class Graph {
     // Per-table expansion (false = show only PK + FK + 2 more cols)
     this.expandedTables = new Set();
     this.TABLE_COLS_PREVIEW = 5;
-    // Importance metric: fan-in + fan-out per file
+    // Weighted file score used for ordering and zoomed decision hints.
     this.importance = new Map();
     // Zoomed-in mode: render export/consumer detail when zoom > threshold
     this.exportConsumers = new Map();   // "fileId|exportName" -> Set<consumerFileId>
@@ -353,6 +606,8 @@ class Graph {
 
     this.replaced = { removed: new Set(), added: new Set(), title: '' };
     this.agentActivity = new Map(); // file id -> agent id -> { label, color, kind, last, count }
+    this.featureRelayoutTimer = null;
+    this.focusCompactId = null;
 
     this.camera = { x: 0, y: 0, zoom: 1 };
     this.cameraTarget = { x: 0, y: 0, zoom: 1 };
@@ -414,6 +669,8 @@ class Graph {
       kind: f.kind,
       dir: f.dir,
       columns: f.columns,
+      exports: f.exports,
+      gitStatus: f.gitStatus,
       fullPath: f.fullPath,
       verb: f.verb,
     };
@@ -421,6 +678,7 @@ class Graph {
 
   requestWorkerLayout() {
     if (!this.layoutWorker || this.layoutWorkerDisabled || !this.files.size) return false;
+    if (this.focusCompactId && this.files.has(this.focusCompactId)) return false;
     const nodes = [...this.files.values()].map(f => this.layoutNodeSnapshot(f));
     const visibleKinds = [...this.visibleKinds];
     const matchSet = [...this.matchSet];
@@ -440,7 +698,7 @@ class Graph {
         seq,
         data: {
           nodes,
-          edges: (this.fileEdges || []).map(e => ({ id: e.id, source: e.source, target: e.target, type: e.type })),
+          edges: (this.fileEdges || []).map(e => ({ id: e.id, source: e.source, target: e.target, type: e.type, transitive: !!e.transitive })),
           opts: {
             visibleKinds,
             matchSet,
@@ -448,6 +706,7 @@ class Graph {
             expandedTables: [...this.expandedTables],
             tablePreviewRows: this.TABLE_PREVIEW_ROWS,
             importance: [...this.importance.entries()],
+            activeFileIds: [...this.agentActivity.keys()],
             topPad: (this.topOcclusion ? this.topOcclusion() : 80) + 28,
           },
         },
@@ -660,9 +919,11 @@ class Graph {
           this.relayout();
         } else if (h) {
           this.selected = h;
+          if (h.kind === 'file') this.setFocusCompact(h.id, { fit: true });
           if (this.onSelect) this.onSelect(h);
         } else {
           this.selected = null;
+          this.clearFocusCompact({ fit: true });
           if (this.onSelect) this.onSelect(null);
         }
         this.invalidate();
@@ -675,6 +936,7 @@ class Graph {
       const h = this.hit(p.x, p.y);
       if (h) {
         this.selected = h;
+        if (h.kind === 'file') this.setFocusCompact(h.id, { fit: true });
         this.invalidate();
         if (this.onSelect) this.onSelect(h);
         if (this.onContext) this.onContext(h, e.clientX, e.clientY);
@@ -844,11 +1106,17 @@ class Graph {
       // e.g., "POST /api/auth"
       return `${f.label} ${f.sublabel}`;
     }
-    if ((f.kind === 'page' || f.kind === 'layout' || f.kind === 'template') && f.sublabel) {
-      return f.sublabel; // "/", "/dashboard"
+    if (f.kind === 'page' && f.sublabel) {
+      return this.pageDisplayLabel(f);
     }
-    if ((f.kind === 'hook' || f.kind === 'component') && f.sublabel) {
-      return f.sublabel; // "useSession", "Header"
+    if ((f.kind === 'layout' || f.kind === 'template') && f.sublabel) {
+      return this.routeFileDisplayLabel(f);
+    }
+    if (f.kind === 'component') {
+      return this.componentDisplayLabel(f);
+    }
+    if (f.kind === 'hook' && f.sublabel) {
+      return f.sublabel; // "useSession"
     }
     if (['config', 'infra', 'docs', 'schema'].includes(f.kind) && (f.sublabel || f.filename)) {
       return f.sublabel || f.filename;
@@ -873,11 +1141,128 @@ class Graph {
     return f.label || f.filename || f.id;
   }
 
+  pageDisplayLabel(f) {
+    const route = f.sublabel || '';
+    const role = this.primaryExportName(f, 'page');
+    if (role && role !== 'Page') return `${role} ${route}`.trim();
+    return route || f.filename || f.id;
+  }
+
+  routeFileDisplayLabel(f) {
+    const route = f.sublabel || '';
+    const role = this.primaryExportName(f, f.kind) || f.label || f.kind;
+    return `${role} ${route}`.trim();
+  }
+
+  componentDisplayLabel(f) {
+    const role = this.primaryExportName(f, 'component') || f.sublabel || f.filename || f.id;
+    const context = this.componentRouteContext(f);
+    return context ? `${context}/${role}` : role;
+  }
+
+  primaryExportName(f, kind) {
+    const skip = new Set([
+      'default', 'metadata', 'viewport', 'revalidate', 'dynamic', 'runtime',
+      'generateMetadata', 'generateViewport', 'generateStaticParams',
+    ]);
+    const names = (f.exports || [])
+      .map(e => e && e.name)
+      .filter(name => name && !skip.has(name) && !/Props$|Params$|Config$|Metadata$/i.test(name));
+    if (!names.length) return f.sublabel || '';
+    if (kind === 'page') {
+      return names.find(name => /(Page|Screen|View)$/i.test(name)) || names.find(name => /^[A-Z]/.test(name)) || names[0];
+    }
+    return names.find(name => /^[A-Z]/.test(name)) || names[0];
+  }
+
+  componentRouteContext(f) {
+    const parts = String(f.id || '').split('/').slice(0, -1);
+    const appIdx = parts.lastIndexOf('app');
+    if (appIdx !== -1) {
+      const routeParts = parts.slice(appIdx + 1)
+        .filter(part => part && !/^\(.+\)$/.test(part))
+        .filter(part => !['components', 'component', '_components', 'ui'].includes(part));
+      if (routeParts.length) return routeParts.slice(-2).join('/');
+    }
+    return '';
+  }
+
+  kindBaseWeight(kind) {
+    return {
+      endpoint: 10,
+      table: 8,
+      page: 7,
+      route: 6,
+      middleware: 6,
+      service: 5,
+      'server-action': 5,
+      job: 4,
+      schema: 4,
+      model: 4,
+      store: 3,
+      layout: 3,
+      template: 3,
+      component: 2,
+      hook: 2,
+      infra: 2,
+      config: 2,
+      test: 1,
+      docs: 1,
+    }[kind] || 1;
+  }
+
+  edgeDecisionWeight(e) {
+    return edgeTypeWeight(e);
+  }
+
+  fileSignalWeight(f) {
+    let score = this.kindBaseWeight(f.kind);
+    if (f.gitStatus && f.gitStatus.dirty) score += f.gitStatus.untracked ? 3 : 4;
+    if (f.deadApiCalls && f.deadApiCalls.length) score += 5 + f.deadApiCalls.length * 2;
+    if (f.exports && f.exports.length) score += Math.min(5, f.exports.length * 0.5);
+    if (f.kind === 'table' && f.columns) score += Math.min(6, f.columns.length * 0.35);
+    if (f.sqlStats) {
+      score += Math.min(8, (f.sqlStats.write || 0) * 2 + (f.sqlStats.read || 0) * 0.75);
+    }
+    if (f.endpointStats) {
+      const st = f.endpointStats;
+      score += st.ui * 2.5 + st.backend * 1.5 + st.db * 2.5 + st.internal;
+    }
+    return score;
+  }
+
+  nodeDetailMeta(f) {
+    if (!f) return '';
+    const score = Math.round(this.importance.get(f.id) || f._importance || 0);
+    const inbound = (this.edgesByTarget.get(f.id) || []).filter(e => !e.isTransitive).length;
+    const outbound = (this.edgesBySource.get(f.id) || []).filter(e => !e.isTransitive).length;
+    const parts = [`weight ${score}`];
+    if (f.kind === 'endpoint') {
+      const st = f.endpointStats || { ui: 0, backend: 0, db: 0, internal: 0 };
+      parts.push(`ui ${st.ui}`, `api ${st.backend + st.internal}`, `db ${st.db}`);
+    } else if (f.kind === 'table') {
+      if (f.columns && f.columns.length) parts.push(`${f.columns.length} cols`);
+      if (f.sqlStats) {
+        if (f.sqlStats.read) parts.push(`read ${f.sqlStats.read}`);
+        if (f.sqlStats.write) parts.push(`write ${f.sqlStats.write}`);
+      }
+    } else {
+      parts.push(`in ${inbound}`, `out ${outbound}`);
+      if (f.exports && f.exports.length) parts.push(`exports ${f.exports.length}`);
+    }
+    const fnRefs = this.functionEdgesForFile ? this.functionEdgesForFile(f.id).length : 0;
+    if (fnRefs) parts.push(`refs ${fnRefs}`);
+    if (f.gitStatus && f.gitStatus.dirty) parts.push('dirty');
+    if (f.deadApiCalls && f.deadApiCalls.length) parts.push(`unmapped ${f.deadApiCalls.length}`);
+    return parts.filter(Boolean).join(' · ');
+  }
+
   load(graphData) {
     this.layers = [];
     this.files.clear();
     this.fileEdges = [];
     this.fnEdges = graphData.fnEdges || [];
+    this.rebuildFunctionEdgeIndexes();
     this.visibleKinds = new Set([
       'page', 'service', 'endpoint', 'component', 'hook', 'store', 'layout', 'special', 'middleware',
       'server-action', 'job', 'schema', 'table', 'model', 'infra', 'app',
@@ -886,6 +1271,7 @@ class Graph {
     this.replaced = { removed: new Set(), added: new Set(), title: '' };
     this.searchQuery = '';
     this.matchSet.clear();
+    this.focusCompactId = null;
 
     for (const n of graphData.nodes) {
       const isExt = n.type === 'external';
@@ -930,6 +1316,7 @@ class Graph {
       e.dbOps = e.operations || [];
     }
     this.rebuildEdgeIndexes();
+    this.rebuildFunctionEdgeIndexes();
 
     const visibleNonExternal = [...this.files.values()].filter(f => f.kind !== 'external');
     const currentlyVisible = visibleNonExternal.filter(f => this.visibleKinds.has(f.kind)).length;
@@ -970,12 +1357,18 @@ class Graph {
       }
     }
 
-    // Compute importance: fan-in + fan-out
+    // Compute a weighted "decision" score. This is intentionally not just
+    // fan-in/fan-out: UI/API/DB touchpoints and dirty/unmapped files should
+    // float up because those are the files that most affect day-to-day work.
     this.importance.clear();
     const bump = (id, w = 1) => this.importance.set(id, (this.importance.get(id) || 0) + w);
+    for (const f of this.files.values()) bump(f.id, this.fileSignalWeight(f));
     for (const e of this.fileEdges) {
-      bump(e.source, 1);
-      bump(e.target, 1);
+      const w = this.edgeDecisionWeight(e);
+      bump(e.source, w);
+      bump(e.target, w);
+      if (e.isApiCall) bump(e.target, 2);
+      if (e.isDbQuery) bump(e.target, 2);
     }
 
     // Index "who consumes file X's named export Y". This powers the export-hover
@@ -1010,15 +1403,11 @@ class Graph {
     this.fit();
   }
 
-  // Fully dynamic horizontal-column layout.
-  //   - Each architectural layer (INTERFACE / SERVER / DATA / SUPPORT) becomes
-  //     a vertical column placed side-by-side. Diagram grows to the SIDES.
-  //   - All sizes are derived from the actual content: column widths come from
-  //     the widest item that needs to fit; section heights from the items
-  //     within. Nothing is hardcoded by repo or kind.
-  //   - Within each column, sections (Pages, Endpoints, Tables…) stack
-  //     vertically. Within a section, items wrap into rows that fit the
-  //     column's width.
+  // Fully dynamic map layout.
+  //   - Files are grouped into folder/module panels.
+  //   - Panel internals are measured from real labels, columns, and detail rows.
+  //   - Panels pack into a balanced picture so large repos stay inspectable
+  //     instead of becoming a long dependency strip.
   refreshVisibleCaches() {
     this.visibleFiles = [...this.files.values()].filter(f => !f.hidden);
     this.hitFiles = this.visibleFiles.slice();
@@ -1044,12 +1433,20 @@ class Graph {
     this.neighborhoodCache = null;
     const ctx = this.ctx;
     const topPad = (this.topOcclusion ? this.topOcclusion() : 80) + 28;
+    const compactFocusId = this.focusCompactId && this.files.has(this.focusCompactId)
+      ? this.focusCompactId
+      : null;
+    const compactScores = compactFocusId ? this.compactFocusScores(compactFocusId) : null;
+    const compactSet = compactScores ? new Set(compactScores.keys()) : null;
 
     // ---- 1. Find visible files ----
     const allVisible = [];
     for (const f of this.files.values()) {
       const forceVisible = this.searchQuery && this.matchSet.has(f.id);
-      if (!this.visibleKinds.has(f.kind) && !forceVisible) { f.hidden = true; continue; }
+      f._focusScore = compactScores ? (compactScores.get(f.id) || 0) : 0;
+      if (compactSet && !compactSet.has(f.id)) { f.hidden = true; continue; }
+      const compactForce = !!(compactSet && compactSet.has(f.id));
+      if (!this.visibleKinds.has(f.kind) && !forceVisible && !compactForce) { f.hidden = true; continue; }
       f.hidden = false;
       allVisible.push(f);
     }
@@ -1061,6 +1458,12 @@ class Graph {
     }
     const N = allVisible.length;
     const density = N <= 80 ? 'small' : N <= 320 ? 'medium' : 'large';
+    const activeFileIds = new Set(this.agentActivity ? this.agentActivity.keys() : []);
+    const featureScores = computeFeatureScores(new Map(allVisible.map(f => [f.id, f])), this.fileEdges, {
+      matchSet: this.matchSet,
+      activeFileIds,
+    });
+    for (const f of allVisible) f._featureScore = featureScores.get(f.id) || 0;
 
     // ---- 2. Layout primitives. Module panels are intentionally tighter
     //         than the old layer columns: smaller PILL_MAX_W so labels
@@ -1068,20 +1471,20 @@ class Graph {
     //         stay box-shaped and stack predictably.
     const fontPills = `400 12px ${FONT_MONO}`;
     const fontTable = `400 11px ${FONT_MONO}`;
-    const PILL_PAD_X = 16;
-    const PILL_MIN_W = density === 'small' ? 112 : density === 'medium' ? 92 : 82;
-    const PILL_MAX_W = density === 'small' ? 360 : density === 'medium' ? 320 : 280;
-    const PILL_H = density === 'small' ? 32 : 28;
+    const PILL_PAD_X = 18;
+    const PILL_MIN_W = density === 'small' ? 132 : density === 'medium' ? 118 : 104;
+    const PILL_MAX_W = density === 'small' ? 460 : density === 'medium' ? 420 : 380;
+    const PILL_H = density === 'small' ? 36 : 34;
     const LABEL_LINE_H = 14;
-    const ITEM_GAP = 8;
-    const ROW_GAP = 10;
-    const SECTION_HEAD_H = 26;
-    const SECTION_GAP = 22;
-    const PANEL_PAD_X = 14;          // inner left/right padding of each module panel
-    const PANEL_PAD_TOP = 32;        // room for the module title above sections
-    const PANEL_PAD_BOTTOM = 14;
-    const MOD_X_GAP = density === 'small' ? 56 : 44;
-    const MOD_Y_GAP = density === 'small' ? 64 : 56;
+    const ITEM_GAP = 14;
+    const ROW_GAP = 16;
+    const SECTION_HEAD_H = 30;
+    const SECTION_GAP = 32;
+    const PANEL_PAD_X = 20;          // inner left/right padding of each module panel
+    const PANEL_PAD_TOP = 40;        // room for the module title above sections
+    const PANEL_PAD_BOTTOM = 22;
+    const MOD_X_GAP = density === 'small' ? 84 : 72;
+    const MOD_Y_GAP = density === 'small' ? 88 : 76;
 
     // Measure the natural width of a label (with kind-specific overrides
     // for tables, which need to fit their widest column).
@@ -1098,14 +1501,41 @@ class Graph {
       return Math.ceil(Math.min(PILL_MAX_W, ctx.measureText(lbl).width + PILL_PAD_X * 2));
     };
 
+    if (compactFocusId) {
+      this.relayoutFunctionalFocus({
+        files: allVisible,
+        focusId: compactFocusId,
+        topPad,
+        measureLabel,
+        PILL_PAD_X,
+        PILL_MIN_W,
+        PILL_MAX_W,
+        PILL_H,
+        LABEL_LINE_H,
+        ITEM_GAP,
+        ROW_GAP,
+        SECTION_HEAD_H,
+        SECTION_GAP,
+        PANEL_PAD_X,
+        PANEL_PAD_TOP,
+        PANEL_PAD_BOTTOM,
+        MOD_X_GAP,
+        MOD_Y_GAP,
+      });
+      return;
+    }
+
     // ---- 3. Bucket files into modules (folder-based panels). ----
     const modDepth = pickModuleDepth(allVisible);
-    const modOf    = (f) => moduleKeyOf(f, modDepth);
+    const modOf = compactFocusId
+      ? ((f) => focusModuleKeyOf(f, compactFocusId))
+      : ((f) => moduleKeyOf(f, modDepth));
     for (const f of allVisible) f._mod = modOf(f);
     const moduleMap = new Map();
     for (const f of allVisible) {
       const key = f._mod;
-      if (!moduleMap.has(key)) moduleMap.set(key, { id: key, name: moduleDisplayName(key), files: [] });
+      const name = compactFocusId ? focusModuleDisplayName(key) : moduleDisplayName(key);
+      if (!moduleMap.has(key)) moduleMap.set(key, { id: key, name, files: [] });
       moduleMap.get(key).files.push(f);
     }
     const moduleIds = new Set(moduleMap.keys());
@@ -1132,14 +1562,34 @@ class Graph {
         const arr = byKind.get(k);
         if (k === 'endpoint') {
           arr.sort((a, b) => {
+            const xa = a._focusScore || 0;
+            const xb = b._focusScore || 0;
+            if (xa !== xb) return xb - xa;
+            const fa = a._featureScore || 0;
+            const fb = b._featureScore || 0;
+            if (fa !== fb) return fb - fa;
             const pa = endpointPathOf(a), pb = endpointPathOf(b);
             if (pa !== pb) return pa.localeCompare(pb);
             return endpointVerbRank(a) - endpointVerbRank(b);
           });
         } else if (k === 'table') {
-          arr.sort((a, b) => (a.label || '').localeCompare(b.label || ''));
+          arr.sort((a, b) => {
+            const xa = a._focusScore || 0;
+            const xb = b._focusScore || 0;
+            if (xa !== xb) return xb - xa;
+            const fa = a._featureScore || 0;
+            const fb = b._featureScore || 0;
+            if (fa !== fb) return fb - fa;
+            return (a.label || '').localeCompare(b.label || '');
+          });
         } else {
           arr.sort((a, b) => {
+            const xa = a._focusScore || 0;
+            const xb = b._focusScore || 0;
+            if (xa !== xb) return xb - xa;
+            const fa = a._featureScore || 0;
+            const fb = b._featureScore || 0;
+            if (fa !== fb) return fb - fa;
             const ia = this.importance.get(a.id) || 0;
             const ib = this.importance.get(b.id) || 0;
             if (ia !== ib) return ib - ia;
@@ -1156,9 +1606,9 @@ class Graph {
       widths.sort((a, b) => a - b);
       const med = widths.length ? widths[Math.floor(widths.length / 2)] : PILL_MIN_W;
       const max = widths.length ? widths[widths.length - 1] : PILL_MIN_W;
-      // sqrt-cols heuristic, capped at 3 so panels stay narrow and rows can
-      // hold many of them.
-      const targetCols = Math.max(1, Math.min(3, Math.round(Math.sqrt(files.length) / 1.8)));
+      // Keep rows readable. Wider labels are more useful than cramming many
+      // generic-looking pills into the same line.
+      const targetCols = Math.max(1, Math.min(2, Math.round(Math.sqrt(files.length) / 2.4)));
       const innerW = Math.ceil(Math.max(
         PILL_MIN_W,
         max,
@@ -1217,14 +1667,16 @@ class Graph {
           let w = Math.max(PILL_MIN_W, Math.min(PILL_MAX_W, labelW));
           const imp = this.importance.get(f.id) || 0;
           f._importance = imp;
-          w = Math.min(PILL_MAX_W, Math.ceil(w + Math.min(32, Math.log2(imp + 1) * 5)));
+          w = Math.min(PILL_MAX_W, Math.ceil(w + Math.min(44, Math.log2(imp + 1) * 6)));
           if (w > sectionW) w = sectionW;
           const labelMaxW = Math.max(20, w - PILL_PAD_X * 2);
-          f._labelLines   = this.wrapLabel(ctx, this.displayLabel(f), labelMaxW, f.kind === 'endpoint' ? 3 : 2);
+          const maxLabelLines = (f.kind === 'endpoint' || f.kind === 'page' || f.kind === 'component') ? 3 : 2;
+          f._labelLines   = this.wrapLabel(ctx, this.displayLabel(f), labelMaxW, maxLabelLines);
           const textH         = f._labelLines.length * LABEL_LINE_H;
           const endpointMetaH = f.kind === 'endpoint' ? 16 : 0;
-          const minH          = f.kind === 'endpoint' ? 48 : PILL_H;
-          const h = Math.max(minH, textH + 14 + endpointMetaH + Math.min(6, Math.log2(imp + 1) * 1.4));
+          const decisionMetaH = f.kind === 'endpoint' ? 0 : 14;
+          const minH          = f.kind === 'endpoint' ? 48 : PILL_H + decisionMetaH;
+          const h = Math.max(minH, textH + 14 + endpointMetaH + decisionMetaH + Math.min(8, Math.log2(imp + 1) * 1.5));
           return { w, h };
         };
 
@@ -1281,67 +1733,39 @@ class Graph {
     };
     for (const mod of moduleMap.values()) layoutPanel(mod);
 
-    // ---- 5. Build module-level DAG, then tier by longest-path. ----
+    // ---- 5. Build module-level DAG for ordering, then pack modules into a
+    //         square-ish picture instead of a long dependency timeline. ----
     const { out: modOut } = buildModuleAdjacency(this.fileEdges, this.files, modOf, moduleIds);
     const tier = computeModuleTiers(modOut, moduleIds);
-
-    // Group modules into tier rows.
-    const byTier = new Map();
     for (const mod of moduleMap.values()) {
-      const t = tier.get(mod.id) || 0;
-      if (!byTier.has(t)) byTier.set(t, []);
-      byTier.get(t).push(mod);
+      mod._tier = tier.get(mod.id) || 0;
+      mod._score = mod.files.reduce((sum, f) => sum + (this.importance.get(f.id) || 0), 0);
+      mod._featureScore = mod.files.reduce((sum, f) => sum + (f._featureScore || 0), 0);
+      mod._focusScore = mod.files.reduce((sum, f) => sum + (f._focusScore || 0), 0);
+      mod._componentScore = mod.files.reduce((sum, f) => {
+        return sum + (['page', 'component', 'hook', 'store'].includes(f.kind) ? (this.importance.get(f.id) || 1) : 0);
+      }, 0);
     }
-    const tierKeys = [...byTier.keys()].sort((a, b) => a - b);
 
-    // ---- 6. Place tier rows top-to-bottom. Within each row, modules are
-    //         ordered by barycenter so cross-tier edges trend vertically
-    //         instead of crisscrossing horizontally. ----
-    const placedCenterX = new Map();
-    let yCursor = topPad;
-
-    for (const tIdx of tierKeys) {
-      const rowMods = byTier.get(tIdx);
-      if (tIdx === tierKeys[0]) {
-        // First tier (entry points): largest panels first.
-        rowMods.sort((a, b) => b.files.length - a.files.length || a.id.localeCompare(b.id));
-      } else {
-        for (const mod of rowMods) {
-          let sum = 0, n = 0;
-          for (const otherId of placedCenterX.keys()) {
-            const fromOther = modOut.get(otherId);
-            const fromSelf  = modOut.get(mod.id);
-            if ((fromOther && fromOther.has(mod.id)) || (fromSelf && fromSelf.has(otherId))) {
-              sum += placedCenterX.get(otherId);
-              n++;
-            }
-          }
-          mod._barycenter = n ? sum / n : 0;
-        }
-        const orig = new Map(rowMods.map((m, i) => [m.id, i]));
-        rowMods.sort((a, b) => {
-          const ba = a._barycenter, bb = b._barycenter;
-          if (ba !== bb) return ba - bb;
-          return orig.get(a.id) - orig.get(b.id);
-        });
-      }
-      const rowW = rowMods.reduce((s, m) => s + m._panelW, 0) + MOD_X_GAP * Math.max(0, rowMods.length - 1);
-      let xCursor = -rowW / 2;
-      let rowH = 0;
-      for (const mod of rowMods) {
-        // Translate inner coords (panel-local) into world space.
+    const orderedModules = orderModulesByFeatureFlow([...moduleMap.values()], modOut).sort((a, b) => {
+      if (!compactFocusId) return 0;
+      if (b._focusScore !== a._focusScore) return b._focusScore - a._focusScore;
+      return a.id.localeCompare(b.id);
+    });
+    packModulePicture(orderedModules, {
+      xGap: MOD_X_GAP,
+      yGap: MOD_Y_GAP,
+      topPad,
+      targetAspect: 1.08,
+      translate: (mod, x, y) => {
         for (const s of mod.sections) {
-          s.x += xCursor; s.y += yCursor;
-          for (const f of s.files) { f.x += xCursor; f.y += yCursor; }
+          s.x += x; s.y += y;
+          for (const f of s.files) { f.x += x; f.y += y; }
         }
-        mod.x = xCursor;
-        mod.y = yCursor;
-        placedCenterX.set(mod.id, xCursor + mod._panelW / 2);
-        xCursor += mod._panelW + MOD_X_GAP;
-        rowH = Math.max(rowH, mod._panelH);
-      }
-      yCursor += rowH + MOD_Y_GAP;
-    }
+        mod.x = x;
+        mod.y = y;
+      },
+    });
 
     // ---- 7. Publish layers (one entry per module panel). The renderer
     //         iterates these to draw panel chrome + sections. ----
@@ -1355,6 +1779,372 @@ class Graph {
     }));
 
     // AI is no longer rendered on the canvas
+    this.aiNode.x = -99999;
+    this.aiNode.y = -99999;
+    this.refreshVisibleCaches();
+    this.invalidate();
+  }
+
+  relayoutFunctionalFocus(opts) {
+    const {
+      files, focusId, topPad, measureLabel,
+      PILL_PAD_X, PILL_MIN_W, PILL_MAX_W, PILL_H, LABEL_LINE_H,
+      ITEM_GAP, ROW_GAP, SECTION_HEAD_H, SECTION_GAP,
+      PANEL_PAD_X, PANEL_PAD_TOP, PANEL_PAD_BOTTOM, MOD_X_GAP, MOD_Y_GAP,
+    } = opts;
+    const focus = this.files.get(focusId);
+    if (!focus) return;
+    const visibleIds = new Set(files.map(f => f.id));
+    const assigned = new Set([focusId]);
+    const get = id => this.files.get(id);
+    const addUnique = (arr, f) => {
+      if (!f || !visibleIds.has(f.id) || assigned.has(f.id)) return false;
+      assigned.add(f.id);
+      arr.push(f);
+      return true;
+    };
+    const addGrouped = (map, key, f) => {
+      if (!f || !visibleIds.has(f.id) || assigned.has(f.id)) return false;
+      assigned.add(f.id);
+      const label = key || 'refs';
+      if (!map.has(label)) map.set(label, []);
+      map.get(label).push(f);
+      return true;
+    };
+
+    const relationScore = new Map([[focusId, 10000]]);
+    const bumpRelation = (id, score) => {
+      if (!id || !visibleIds.has(id)) return;
+      relationScore.set(id, (relationScore.get(id) || 0) + score);
+    };
+    for (const edge of this.referenceEdgesForFile(focusId)) {
+      const other = edge.sourceFile === focusId ? edge.targetFile : edge.sourceFile;
+      bumpRelation(other, edge.kind === 'function' ? 240 : 190);
+    }
+    for (const e of this.edgesByTarget.get(focusId) || []) {
+      bumpRelation(e.source, 120 + edgeTypeWeight(e) * 12);
+    }
+    for (const e of this.edgesBySource.get(focusId) || []) {
+      bumpRelation(e.target, 126 + edgeTypeWeight(e) * 12);
+    }
+    for (const f of files) {
+      if (f.id === focusId) continue;
+      const relation = contextRelation(focus, f);
+      if (relation) bumpRelation(f.id, relation.score * 0.7);
+    }
+
+    const buckets = {
+      entry: [],
+      components: [],
+      state: [],
+      domain: [],
+      effects: [],
+      contracts: [],
+      integrations: [],
+      data: [],
+      risk: [],
+      validation: [],
+      context: [],
+    };
+    const bucketFor = (f) => {
+      if (f.gitStatus && f.gitStatus.dirty) return 'risk';
+      if (f.deadApiCalls && f.deadApiCalls.length) return 'risk';
+      if (['page', 'layout', 'template', 'app', 'document'].includes(f.kind)) return 'entry';
+      if (['component', 'styles', 'loading', 'error', 'notfound', 'special'].includes(f.kind)) return 'components';
+      if (['hook', 'store'].includes(f.kind)) return 'state';
+      if (['service', 'server-action'].includes(f.kind)) return 'domain';
+      if (['middleware', 'job'].includes(f.kind)) return 'effects';
+      if (['endpoint', 'route'].includes(f.kind)) return 'contracts';
+      if (['table', 'schema', 'model'].includes(f.kind)) return 'data';
+      if (['infra', 'config', 'external'].includes(f.kind)) return 'integrations';
+      if (['test', 'docs'].includes(f.kind)) return 'validation';
+      return contextRelation(focus, f) ? 'context' : 'integrations';
+    };
+    const byArchitectScore = (a, b) => {
+      const ra = relationScore.get(a.id) || 0;
+      const rb = relationScore.get(b.id) || 0;
+      if (ra !== rb) return rb - ra;
+      const fa = a._focusScore || 0;
+      const fb = b._focusScore || 0;
+      if (fa !== fb) return fb - fa;
+      const ia = this.importance.get(a.id) || 0;
+      const ib = this.importance.get(b.id) || 0;
+      if (ia !== ib) return ib - ia;
+      return this.displayLabel(a).localeCompare(this.displayLabel(b));
+    };
+
+    for (const f of files.slice().sort(byArchitectScore)) {
+      if (f.id === focusId || assigned.has(f.id)) continue;
+      const bucket = buckets[bucketFor(f)] || buckets.context;
+      addUnique(bucket, f);
+    }
+
+    const sortFiles = arr => arr.sort((a, b) => {
+      const ra = relationScore.get(a.id) || 0;
+      const rb = relationScore.get(b.id) || 0;
+      if (ra !== rb) return rb - ra;
+      const fa = a._focusScore || 0;
+      const fb = b._focusScore || 0;
+      if (fa !== fb) return fb - fa;
+      const ia = this.importance.get(a.id) || 0;
+      const ib = this.importance.get(b.id) || 0;
+      if (ia !== ib) return ib - ia;
+      return this.displayLabel(a).localeCompare(this.displayLabel(b));
+    });
+
+    const panels = [];
+    const makePanel = (id, name, sections, targetW = 430) => {
+      const liveSections = sections
+        .map(section => ({ ...section, files: sortFiles((section.files || []).filter(Boolean)) }))
+        .filter(section => section.files.length);
+      if (!liveSections.length) return null;
+
+      const clusters = [];
+      for (const section of liveSections) {
+        const splitByFolder = section.files.length > 3 || liveSections.length === 1;
+        const grouped = new Map();
+        for (const f of section.files) {
+          const key = splitByFolder ? architectClusterLabel(f, focus) : section.name;
+          if (!grouped.has(key)) grouped.set(key, []);
+          grouped.get(key).push(f);
+        }
+        for (const [clusterName, group] of grouped) {
+          clusters.push({
+            kind: section.kind,
+            name: String(clusterName || section.name).toUpperCase(),
+            files: sortFiles(group),
+          });
+        }
+      }
+
+      const innerW = Math.max(260, targetW - PANEL_PAD_X * 2);
+      const panel = {
+        id: `focus:${id}`,
+        name,
+        isModule: true,
+        layout: 'cluster',
+        fileCount: clusters.reduce((n, s) => n + s.files.length, 0),
+        sections: [],
+        x: 0, y: 0, w: targetW, h: 0,
+      };
+      const sizeNode = (f, sectionW) => {
+        if (f.kind === 'table') {
+          const cols = f.columns || [];
+          const expanded = this.expandedTables.has(f.id);
+          const visCols = expanded ? cols : cols.slice(0, this.TABLE_PREVIEW_ROWS);
+          f._visibleCols = visCols;
+          f._tableExpanded = expanded;
+          f._showFooter = cols.length > this.TABLE_PREVIEW_ROWS;
+          f._moreCount = Math.max(0, cols.length - visCols.length);
+          return { w: sectionW, h: 26 + visCols.length * 17 + (f._showFooter ? 24 : 8) };
+        }
+        f._endpointCompact = false;
+        f._endpointPath = '';
+        f._endpointVerb = '';
+        const imp = this.importance.get(f.id) || 0;
+        f._importance = imp;
+        let w = Math.max(PILL_MIN_W, Math.min(PILL_MAX_W, measureLabel(f)));
+        w = Math.min(PILL_MAX_W, Math.ceil(w + Math.min(38, Math.log2(imp + 1) * 5)));
+        if (w > sectionW) w = sectionW;
+        const labelMaxW = Math.max(20, w - PILL_PAD_X * 2);
+        const maxLabelLines = (f.kind === 'endpoint' || f.kind === 'page' || f.kind === 'component') ? 3 : 2;
+        f._labelLines = this.wrapLabel(this.ctx, this.displayLabel(f), labelMaxW, maxLabelLines);
+        const decisionMetaH = f.kind === 'endpoint' ? 0 : 14;
+        const textH = f._labelLines.length * LABEL_LINE_H;
+        return { w, h: Math.max(f.kind === 'endpoint' ? 48 : PILL_H + decisionMetaH, textH + 14 + (f.kind === 'endpoint' ? 16 : decisionMetaH)) };
+      };
+
+      const buildCluster = (clusterInput) => {
+        const boxes = clusterInput.files.map(f => ({ f, ...sizeNode(f, innerW) }));
+        const tableLike = boxes.some(b => b.f.kind === 'table');
+        const section = {
+          kind: clusterInput.kind,
+          name: clusterInput.name,
+          files: clusterInput.files,
+          allCount: clusterInput.files.length,
+          hiddenCount: 0,
+          canExpand: false,
+          expanded: true,
+          x: 0, y: 0, w: 0, h: 0,
+        };
+        if (boxes.some(b => b.f.kind === 'table')) {
+          section.w = Math.min(innerW, Math.max(280, ...boxes.map(b => b.w + 24)));
+          let rowY = 32;
+          for (const box of boxes) {
+            box.f.x = 12;
+            box.f.y = rowY;
+            box.f.w = Math.min(section.w - 24, box.w);
+            box.f.h = box.h;
+            box.f.hidden = false;
+            rowY += box.h + ROW_GAP;
+          }
+          section.h = Math.max(72, rowY - ROW_GAP + 14);
+          return section;
+        }
+
+        const maxBoxW = Math.max(...boxes.map(b => b.w), 120);
+        const targetCols = boxes.length <= 2 ? boxes.length : Math.min(3, Math.ceil(Math.sqrt(boxes.length)));
+        const softRowW = Math.min(innerW, Math.max(maxBoxW + 32, maxBoxW * targetCols + ITEM_GAP * (targetCols - 1) + 28));
+        const rows = [];
+        let row = { boxes: [], w: 0, h: 0 };
+        for (const box of boxes) {
+          const nextW = row.boxes.length ? row.w + ITEM_GAP + box.w : box.w;
+          if (row.boxes.length && nextW > softRowW) {
+            rows.push(row);
+            row = { boxes: [], w: 0, h: 0 };
+          }
+          row.boxes.push(box);
+          row.w = row.boxes.length === 1 ? box.w : nextW;
+          row.h = Math.max(row.h, box.h);
+        }
+        if (row.boxes.length) rows.push(row);
+
+        section.w = Math.min(innerW, Math.max(180, ...rows.map(r => r.w + 28)));
+        let rowY = 34;
+        for (let rIdx = 0; rIdx < rows.length; rIdx++) {
+          const r = rows[rIdx];
+          let x = section.w / 2 - r.w / 2;
+          if (rows.length > 1 && rIdx % 2 === 1) x += Math.min(16, (section.w - r.w) * 0.1);
+          for (const box of r.boxes) {
+            box.f.x = x;
+            box.f.y = rowY + (r.h - box.h) / 2;
+            box.f.w = box.w;
+            box.f.h = box.h;
+            box.f.hidden = false;
+            x += box.w + ITEM_GAP;
+          }
+          rowY += r.h + ROW_GAP;
+        }
+        section.h = Math.max(72, rowY - ROW_GAP + 14);
+        return section;
+      };
+
+      const built = clusters.map(buildCluster)
+        .sort((a, b) => {
+          const aScore = a.files.reduce((sum, f) => sum + (relationScore.get(f.id) || f._focusScore || 0), 0);
+          const bScore = b.files.reduce((sum, f) => sum + (relationScore.get(f.id) || f._focusScore || 0), 0);
+          return bScore - aScore || b.files.length - a.files.length || a.name.localeCompare(b.name);
+        });
+
+      let row = { sections: [], w: 0, h: 0 };
+      const rows = [];
+      for (const section of built) {
+        const nextW = row.sections.length ? row.w + ITEM_GAP + section.w : section.w;
+        if (row.sections.length && nextW > innerW) {
+          rows.push(row);
+          row = { sections: [], w: 0, h: 0 };
+        }
+        row.sections.push(section);
+        row.w = row.sections.length === 1 ? section.w : nextW;
+        row.h = Math.max(row.h, section.h);
+      }
+      if (row.sections.length) rows.push(row);
+
+      let yCursor = PANEL_PAD_TOP;
+      for (const packedRow of rows) {
+        let xCursor = PANEL_PAD_X + innerW / 2 - packedRow.w / 2;
+        for (const section of packedRow.sections) {
+          section.x += xCursor;
+          section.y += yCursor + (packedRow.h - section.h) / 2;
+          for (const f of section.files) {
+            f.x += section.x;
+            f.y += section.y;
+          }
+          panel.sections.push(section);
+          xCursor += section.w + ITEM_GAP;
+        }
+        yCursor += packedRow.h + SECTION_GAP;
+      }
+      panel.h = Math.max(76, (yCursor - SECTION_GAP) + PANEL_PAD_BOTTOM);
+      return panel;
+    };
+
+    const focusPanel = makePanel('focus', 'ARCHITECTURE FOCUS', [
+      { kind: focus.kind, name: 'SELECTED FILE', files: [focus] },
+    ], 420);
+    const experiencePanel = makePanel('experience', 'EXPERIENCE SURFACE', [
+      { kind: 'page', name: 'ENTRY POINTS / ROUTES', files: buckets.entry },
+      { kind: 'component', name: 'VISIBLE COMPONENTS', files: buckets.components },
+      { kind: 'hook', name: 'CLIENT STATE / HOOKS', files: buckets.state },
+    ], 560);
+    const domainPanel = makePanel('domain', 'ORCHESTRATION / DOMAIN', [
+      { kind: 'service', name: 'BUSINESS LOGIC / SERVICES', files: buckets.domain },
+      { kind: 'job', name: 'EFFECTS / JOBS / MIDDLEWARE', files: buckets.effects },
+    ], 540);
+    const contractPanel = makePanel('contracts', 'CONTRACTS / BOUNDARIES', [
+      { kind: 'endpoint', name: 'API ROUTES / HTTP CONTRACTS', files: buckets.contracts },
+      { kind: 'external', name: 'INTEGRATIONS / CONFIG', files: buckets.integrations },
+    ], 560);
+    const dataPanel = makePanel('data', 'DATA MODEL', [
+      { kind: 'table', name: 'TABLES / SCHEMAS / MODELS', files: buckets.data },
+    ], 540);
+    const riskPanel = makePanel('risk', 'RISK / CONTEXT', [
+      { kind: 'error', name: 'CHANGED / UNMAPPED', files: buckets.risk },
+      { kind: 'test', name: 'TESTS / DOCS', files: buckets.validation },
+      { kind: 'module', name: 'SAME FEATURE / BRIDGES', files: buckets.context },
+    ], 650);
+
+    for (const panel of [experiencePanel, focusPanel, contractPanel, domainPanel, dataPanel, riskPanel]) {
+      if (panel) panels.push(panel);
+    }
+
+    const placePanel = (panel, x, y) => {
+      panel.x = x;
+      panel.y = y;
+      for (const section of panel.sections) {
+        section.x += x;
+        section.y += y;
+        for (const f of section.files) {
+          f.x += x;
+          f.y += y;
+        }
+      }
+    };
+
+    const gapX = Math.max(64, MOD_X_GAP * 0.82);
+    const gapY = Math.max(56, MOD_Y_GAP * 0.72);
+    const panelH = (panel) => panel ? panel.h : 0;
+    const panelW = (panel) => panel ? panel.w : 0;
+    const centerX = (panel) => -panel.w / 2;
+    let y = topPad;
+
+    // Architect read order:
+    //   user surface
+    // risk/context ← selected concern → contracts/boundaries
+    //                 orchestration/domain
+    //                 data model
+    if (experiencePanel) {
+      placePanel(experiencePanel, centerX(experiencePanel), y);
+      y += experiencePanel.h + gapY;
+    }
+
+    const coreY = y;
+    const focusX = focusPanel ? centerX(focusPanel) : 0;
+    if (riskPanel && focusPanel) {
+      placePanel(riskPanel, focusX - gapX - riskPanel.w, coreY);
+    } else if (riskPanel) {
+      placePanel(riskPanel, centerX(riskPanel), coreY);
+    }
+    if (focusPanel) {
+      placePanel(focusPanel, focusX, coreY);
+    }
+    if (contractPanel && focusPanel) {
+      placePanel(contractPanel, focusX + focusPanel.w + gapX, coreY);
+    } else if (contractPanel) {
+      placePanel(contractPanel, centerX(contractPanel), coreY);
+    }
+
+    const coreH = Math.max(panelH(focusPanel), panelH(contractPanel));
+    y = coreY + coreH + gapY;
+    if (domainPanel) {
+      placePanel(domainPanel, centerX(domainPanel), y);
+      y += domainPanel.h + gapY;
+    }
+    if (dataPanel) {
+      placePanel(dataPanel, centerX(dataPanel), y);
+    }
+
+    this.layers = panels;
     this.aiNode.x = -99999;
     this.aiNode.y = -99999;
     this.refreshVisibleCaches();
@@ -1422,7 +2212,11 @@ class Graph {
     if (this.fileEdges) {
       this.fileEdges = this.fileEdges.filter(e => e.source !== id && e.target !== id);
     }
+    if (this.fnEdges) {
+      this.fnEdges = this.fnEdges.filter(e => e.sourceFile !== id && e.targetFile !== id);
+    }
     this.rebuildEdgeIndexes();
+    this.rebuildFunctionEdgeIndexes();
     if (this.importance) this.importance.delete(id);
     if (this.exportConsumers) {
       for (const k of [...this.exportConsumers.keys()]) {
@@ -1431,6 +2225,7 @@ class Graph {
       }
     }
     if (this.agentActivity) this.agentActivity.delete(id);
+    if (this.focusCompactId === id) this.focusCompactId = null;
     if (this.selected && this.selected.id === id) this.selected = null;
     if (this.hovered && this.hovered.id === id) this.hovered = null;
     this.relayout();
@@ -1537,6 +2332,61 @@ class Graph {
     this.neighborhoodCache = null;
   }
 
+  rebuildFunctionEdgeIndexes() {
+    this.fnEdgesBySourceFile = new Map();
+    this.fnEdgesByTargetFile = new Map();
+    for (const e of this.fnEdges || []) {
+      if (!e || !e.sourceFile || !e.targetFile || e.sourceFile === e.targetFile) continue;
+      this.addEdgeIndex(this.fnEdgesBySourceFile, e.sourceFile, e);
+      this.addEdgeIndex(this.fnEdgesByTargetFile, e.targetFile, e);
+    }
+  }
+
+  functionEdgesForFile(id) {
+    return [
+      ...(this.fnEdgesBySourceFile.get(id) || []),
+      ...(this.fnEdgesByTargetFile.get(id) || []),
+    ];
+  }
+
+  symbolEdgesForFile(id) {
+    const out = [];
+    const seen = new Set();
+    const addFromImport = (e) => {
+      if (!e || e.type !== 'import') return;
+      const importer = this.files.get(e.source);
+      const target = this.files.get(e.target);
+      if (!importer || !target || !importer.importsRefs) return;
+      const exportNames = new Set((target.exports || []).map(ex => ex && ex.name).filter(Boolean));
+      for (const ref of importer.importsRefs || []) {
+        for (const name of ref.names || []) {
+          if (exportNames.size && !exportNames.has(name)) continue;
+          const key = `${e.source}->${e.target}:${name}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push({
+            id: key,
+            sourceFile: e.source,
+            targetFile: e.target,
+            sourceExport: null,
+            targetExport: name,
+            kind: 'symbol',
+          });
+        }
+      }
+    };
+    for (const e of this.edgesBySource.get(id) || []) addFromImport(e);
+    for (const e of this.edgesByTarget.get(id) || []) addFromImport(e);
+    return out;
+  }
+
+  referenceEdgesForFile(id) {
+    return [
+      ...this.functionEdgesForFile(id).map(e => ({ ...e, kind: 'function' })),
+      ...this.symbolEdgesForFile(id),
+    ];
+  }
+
   edgesForNodeSet(ids) {
     if (!ids || !ids.size) return [];
     const out = [];
@@ -1596,6 +2446,10 @@ class Graph {
     for (const e of this.edgesByTarget.get(id) || []) {
       if (e.type === 'import' || e.type === 'external') set.add(e.source);
     }
+    for (const fe of this.functionEdgesForFile(id)) {
+      if (fe.sourceFile) set.add(fe.sourceFile);
+      if (fe.targetFile) set.add(fe.targetFile);
+    }
     this.neighborhoodCache = { id, set };
     return set;
   }
@@ -1613,6 +2467,191 @@ class Graph {
       for (const e of this.edgesByTarget.get(id) || []) set.add(e.source);
     }
     return set;
+  }
+
+  compactFocusScores(id) {
+    const focus = this.files.get(id);
+    if (!focus) return null;
+    const scores = new Map([[id, 10000]]);
+    const firstHop = new Map();
+    const maxNodes = 140;
+    const allowed = (f) => {
+      if (!f) return false;
+      return f.id === id || this.visibleKinds.has(f.kind) || this.matchSet.has(f.id);
+    };
+    const touch = (targetId, score, depth, fromEdge = null) => {
+      const f = this.files.get(targetId);
+      if (!allowed(f)) return;
+      scores.set(targetId, Math.max(scores.get(targetId) || 0, score));
+      if (depth === 1) {
+        const prev = firstHop.get(targetId) || { score: 0, functional: false };
+        firstHop.set(targetId, {
+          score: Math.max(prev.score, score),
+          functional: prev.functional || isFunctionalEdge(fromEdge, focus, f),
+        });
+      }
+    };
+    const directEdges = [
+      ...(this.edgesBySource.get(id) || []),
+      ...(this.edgesByTarget.get(id) || []),
+    ];
+    for (const e of directEdges) {
+      const next = e.source === id ? e.target : e.source;
+      const nf = this.files.get(next);
+      if (!nf) continue;
+      const functional = isFunctionalEdge(e, focus, nf);
+      const base = 120 + edgeTypeWeight(e) * 14 + (functional ? 48 : 0);
+      touch(next, base, 1, e);
+    }
+    for (const fe of this.referenceEdgesForFile(id)) {
+      const next = fe.sourceFile === id ? fe.targetFile : fe.sourceFile;
+      const nf = this.files.get(next);
+      if (!nf) continue;
+      const base = (fe.kind === 'function' ? 210 : 178) + (fe.sourceFile === id ? 34 : 24);
+      touch(next, base, 1, { type: 'function-ref' });
+    }
+
+    for (const [hopId, meta] of firstHop) {
+      if (!meta.functional && meta.score < 150) continue;
+      const hf = this.files.get(hopId);
+      if (!hf) continue;
+      const edges = [
+        ...(this.edgesBySource.get(hopId) || []),
+        ...(this.edgesByTarget.get(hopId) || []),
+      ];
+      for (const e of edges) {
+        const next = e.source === hopId ? e.target : e.source;
+        if (next === id) continue;
+        const nf = this.files.get(next);
+        if (!nf) continue;
+        const functional = isFunctionalEdge(e, hf, nf);
+        if (!functional && e.type !== 'import') continue;
+        const score = 58 + edgeTypeWeight(e) * 9 + (functional ? 30 : 0) + Math.min(50, meta.score * 0.12);
+        touch(next, score, 2, e);
+      }
+      for (const fe of this.referenceEdgesForFile(hopId)) {
+        const next = fe.sourceFile === hopId ? fe.targetFile : fe.sourceFile;
+        if (next === id) continue;
+        const score = (fe.kind === 'function' ? 98 : 78) + Math.min(44, meta.score * 0.11);
+        touch(next, score, 2, { type: 'function-ref' });
+      }
+    }
+
+    const contextCandidates = [];
+    for (const f of this.files.values()) {
+      if (!allowed(f) || scores.has(f.id)) continue;
+      const relation = contextRelation(focus, f);
+      if (!relation) continue;
+      contextCandidates.push([f.id, relation.score, relation.reason]);
+    }
+    contextCandidates.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    for (const [nodeId, score] of contextCandidates.slice(0, 44)) {
+      touch(nodeId, score, 2, { type: 'context' });
+    }
+
+    const seeded = new Set(scores.keys());
+    const bridgeScores = new Map();
+    for (const e of this.fileEdges || []) {
+      const sourceSeeded = seeded.has(e.source);
+      const targetSeeded = seeded.has(e.target);
+      if (sourceSeeded === targetSeeded) continue;
+      const next = sourceSeeded ? e.target : e.source;
+      const nf = this.files.get(next);
+      if (!allowed(nf) || seeded.has(next)) continue;
+      bridgeScores.set(next, (bridgeScores.get(next) || 0) + edgeTypeWeight(e));
+    }
+    for (const nodeId of seeded) {
+      for (const fe of this.referenceEdgesForFile(nodeId)) {
+        const next = fe.sourceFile === nodeId ? fe.targetFile : fe.sourceFile;
+        const nf = this.files.get(next);
+        if (!allowed(nf) || seeded.has(next)) continue;
+        bridgeScores.set(next, (bridgeScores.get(next) || 0) + (fe.kind === 'function' ? 8 : 5));
+      }
+    }
+    const bridges = [...bridgeScores.entries()]
+      .filter(([, score]) => score >= 2)
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .slice(0, 32);
+    for (const [nodeId, score] of bridges) {
+      touch(nodeId, 42 + score * 7, 2, { type: 'bridge' });
+    }
+
+    const ranked = [...scores.entries()]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    const keep = new Map([[id, scores.get(id)]]);
+    for (const [nodeId, score] of ranked) {
+      if (keep.size >= maxNodes) break;
+      keep.set(nodeId, score);
+    }
+    return keep;
+  }
+
+  focusSupplementalEdges(id) {
+    if (!id || !this.focusCompactId || this.focusCompactId !== id) return [];
+    const focus = this.files.get(id);
+    if (!focus) return [];
+    const visible = new Set(this.visibleFiles.map(f => f.id));
+    const realPairs = new Set();
+    for (const e of this.visibleEdges || []) {
+      realPairs.add(`${e.source}->${e.target}`);
+      realPairs.add(`${e.target}->${e.source}`);
+    }
+    const out = [];
+    const seen = new Set();
+    const add = (edge) => {
+      const key = `${edge.kind}:${edge.source}->${edge.target}:${edge.label || ''}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(edge);
+    };
+
+    for (const f of this.visibleFiles) {
+      for (const fe of this.referenceEdgesForFile(f.id)) {
+        if (!visible.has(fe.sourceFile) || !visible.has(fe.targetFile)) continue;
+        add({
+          kind: fe.kind === 'function' ? 'function' : 'symbol',
+          source: fe.sourceFile,
+          target: fe.targetFile,
+          label: fe.sourceExport
+            ? `${fe.sourceExport} → ${fe.targetExport || 'ref'}`
+            : `${fe.targetExport || 'symbol'}`,
+        });
+      }
+    }
+
+    for (const f of this.visibleFiles) {
+      if (f.id === id) continue;
+      if (realPairs.has(`${id}->${f.id}`)) continue;
+      const relation = contextRelation(focus, f);
+      if (!relation || relation.score < 44) continue;
+      add({
+        kind: 'context',
+        source: id,
+        target: f.id,
+        label: relation.reason,
+      });
+    }
+    return out.slice(0, 90);
+  }
+
+  setFocusCompact(id, { fit = false } = {}) {
+    if (!id || !this.files.has(id)) return;
+    if (this.focusCompactId === id) {
+      if (fit) this.fit();
+      return;
+    }
+    this.focusCompactId = id;
+    this.neighborhoodCache = null;
+    this.relayout();
+    if (fit) this.fit();
+  }
+
+  clearFocusCompact({ fit = false } = {}) {
+    if (!this.focusCompactId) return;
+    this.focusCompactId = null;
+    this.neighborhoodCache = null;
+    this.relayout();
+    if (fit) this.fit();
   }
 
   touch(targetId, kind = 'read', agent = null) {
@@ -1649,8 +2688,17 @@ class Graph {
       });
       const ordered = [...byAgent.entries()].sort((a, b) => b[1].last - a[1].last);
       for (const [oldId] of ordered.slice(6)) byAgent.delete(oldId);
+      this.scheduleFeatureRelayout();
     }
     this.invalidate();
+  }
+
+  scheduleFeatureRelayout() {
+    if (this.featureRelayoutTimer) return;
+    this.featureRelayoutTimer = setTimeout(() => {
+      this.featureRelayoutTimer = null;
+      this.relayout();
+    }, 800);
   }
 
   setReplacement(removed, added, title = '') {
@@ -1828,6 +2876,25 @@ class Graph {
       for (const s of L.sections) {
         const isHoverSection = this.hovered && this.hovered.kind === 'section' && this.hovered.sectionKind === s.kind;
         const tint = tintRGB(s.kind);
+        if (L.layout === 'cluster') {
+          ctx.strokeStyle = isHoverSection ? tint : tintRGB(s.kind, 0.20);
+          ctx.lineWidth = (isHoverSection ? 1.4 : 1) / z;
+          ctx.strokeRect(s.x, s.y, s.w, s.h);
+          ctx.fillStyle = bgAlpha(0.22);
+          ctx.fillRect(s.x, s.y, s.w, 24);
+          ctx.fillStyle = tint;
+          ctx.fillRect(s.x + 8, s.y + 8, 6, 6);
+          ctx.font = `400 10px ${FONT_MONO}`;
+          ctx.fillStyle = tintRGB(s.kind, isHoverSection ? 0.95 : 0.72);
+          ctx.textAlign = 'left';
+          ctx.textBaseline = 'top';
+          const title = this.truncate(ctx, String(s.name || '').toUpperCase(), Math.max(20, s.w - 46));
+          ctx.fillText(title, s.x + 20, s.y + 5);
+          ctx.textAlign = 'right';
+          ctx.fillStyle = `rgba(${SAND}, ${isHoverSection ? 0.64 : 0.38})`;
+          ctx.fillText(`× ${s.files.length}`, s.x + s.w - 8, s.y + 5);
+          continue;
+        }
         ctx.fillStyle = tint;
         ctx.fillRect(s.x + 2, s.y + 4, 8, 8);
         ctx.font = `400 13px ${FONT_MONO}`;
@@ -1884,6 +2951,7 @@ class Graph {
         // the new layout — they connect distinct panels in the map.
         const crossModule = (a._mod && b._mod && a._mod !== b._mod);
         const crossLayer  = crossModule;
+        const functional = isFunctionalEdge(e, a, b);
         let alpha, lineW, dashed = false;
         if (e.isFk) {
           alpha = anyActive ? 0.08 : 0.28;
@@ -1904,6 +2972,9 @@ class Graph {
           alpha = anyActive ? 0.045 : (direct ? 0.34 : 0.16);
           lineW = (direct ? 1.0 : 0.75) / z;
           dashed = true;
+        } else if (functional) {
+          alpha = anyActive ? 0.05 : (crossModule ? 0.24 : 0.17);
+          lineW = (crossModule ? 0.95 : 0.8) / z;
         } else if (crossLayer) {
           // Any non-api edge that crosses architectural layers
           alpha = anyActive ? 0.04 : 0.18;
@@ -1922,6 +2993,27 @@ class Graph {
         if (dashed) ctx.setLineDash([5 / z, 4 / z]);
         this.drawEdge(ctx, a, b, false, e);
         if (dashed) ctx.setLineDash([]);
+      }
+    }
+
+    if (!fastMode && focusId && this.focusCompactId === focusId) {
+      let labelCount = 0;
+      for (const e of this.focusSupplementalEdges(focusId)) {
+        const a = this.files.get(e.source);
+        const b = this.files.get(e.target);
+        if (!a || !b || a.hidden || b.hidden) continue;
+        if (!edgeInView(a, b)) continue;
+        const isFn = e.kind === 'function';
+        const isSymbol = e.kind === 'symbol';
+        ctx.strokeStyle = isFn ? tintRGB('hook', 0.62) : (isSymbol ? tintRGB('component', 0.42) : `rgba(${SAND}, 0.20)`);
+        ctx.lineWidth = (isFn ? 1.2 : isSymbol ? 0.95 : 0.65) / z;
+        ctx.setLineDash(isFn ? [2.5 / z, 2 / z] : (isSymbol ? [6 / z, 3 / z] : [1 / z, 5 / z]));
+        this.drawEdge(ctx, a, b, isFn || isSymbol, e);
+        ctx.setLineDash([]);
+        if ((isFn || isSymbol) && z >= 0.82 && labelCount < 20 && e.label) {
+          this.drawEdgeLabel(ctx, a, b, e.label, z, isFn ? tintRGB('hook', 0.78) : tintRGB('component', 0.62));
+          labelCount++;
+        }
       }
     }
 
@@ -1954,10 +3046,12 @@ class Graph {
       }
       ctx.fillRect(f.x, f.y, f.w, f.h);
 
-      // Left tint stripe — kind color, gives instant visual differentiation
+      // Left tint stripe — kind color plus width from the weighted decision score.
       if (!isSel) {
+        const score = f._importance || this.importance.get(f.id) || 0;
+        const stripeW = Math.min(8 / z, (3 + Math.log2(score + 1) * 0.9) / z);
         ctx.fillStyle = tintRGB(f.kind, dimmed ? 0.35 : 0.85);
-        ctx.fillRect(f.x, f.y, 3 / z, f.h);
+        ctx.fillRect(f.x, f.y, stripeW, f.h);
       }
 
       // Glow when AI touches
@@ -2015,7 +3109,7 @@ class Graph {
           ctx.font = `400 10px ${FONT_MONO}`;
           ctx.fillStyle = isSel ? INVERT_TEXT : `rgba(${SAND}, ${dimmed ? 0.42 : 0.72})`;
           ctx.fillText(this.truncate(ctx, path, f.w - 18), f.x + 10, f.y + 29);
-          const meta = `UI ${st.ui} DB ${st.db}`;
+          const meta = `weight ${Math.round(this.importance.get(f.id) || f._importance || 0)} · ui ${st.ui} · db ${st.db}`;
           ctx.fillStyle = isSel ? INVERT_TEXT : tintRGB(f.kind, dimmed ? 0.45 : 0.78);
           ctx.fillText(this.truncate(ctx, meta, f.w - 18), f.x + 10, f.y + f.h - 9);
         } else {
@@ -2023,7 +3117,9 @@ class Graph {
           const lines = f._labelLines && f._labelLines.length ? f._labelLines : [this.displayLabel(f)];
           const lineH = 14;
           const blockH = lines.length * lineH;
-          const metaH = f.kind === 'endpoint' ? 15 : 0;
+          const decisionMeta = this.nodeDetailMeta(f);
+          const showDecisionMeta = !!decisionMeta && (f.kind === 'endpoint' || z >= this.TABLE_DETAIL_ZOOM || isSel || isHover || isMatch);
+          const metaH = showDecisionMeta ? (f.kind === 'endpoint' ? 15 : 14) : 0;
           const labelAreaH = f.h - metaH;
           const startY = f.y + labelAreaH / 2 - blockH / 2 + lineH / 2;
           const labelMaxW = f.w - 18;
@@ -2033,13 +3129,11 @@ class Graph {
               : this.truncate(ctx, lines[i], labelMaxW);
             ctx.fillText(written, f.x + 12, startY + i * lineH + 0.5);
           }
-          if (f.kind === 'endpoint') {
-            const st = f.endpointStats || { ui: 0, backend: 0, db: 0, internal: 0 };
-            const meta = `UI ${st.ui} · API ${st.backend} · DB ${st.db} · USES ${st.internal}`;
+          if (showDecisionMeta) {
             ctx.font = `400 10px ${FONT_MONO}`;
             ctx.fillStyle = isSel ? INVERT_TEXT : tintRGB(f.kind, dimmed ? 0.5 : 0.82);
             ctx.textBaseline = 'middle';
-            ctx.fillText(this.truncate(ctx, meta, f.w - 18), f.x + 12, f.y + f.h - 9);
+            ctx.fillText(this.truncate(ctx, decisionMeta, f.w - 18), f.x + 12, f.y + f.h - 9);
           }
         }
       }

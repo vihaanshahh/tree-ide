@@ -69,6 +69,8 @@ async function main() {
       (async () => {
         if (typeof openRepo !== 'function') throw new Error('openRepo is unavailable');
         if (!window.tree || typeof window.tree.onGraphPatch !== 'function') throw new Error('tree transport is missing graph patch subscription');
+        if (typeof window.tree.getUsage !== 'function') throw new Error('tree transport is missing usage snapshot');
+        if (typeof window.tree.onUsageUpdate !== 'function') throw new Error('tree transport is missing usage updates');
         await openRepo(${JSON.stringify(root)});
         return {
           root: state.root,
@@ -76,6 +78,8 @@ async function main() {
           files: graph.files.size,
           hasWorker: !!graph.layoutWorker,
           hud: document.querySelector('#hud-status')?.textContent || '',
+          usageTab: !!document.querySelector('.tab[data-tab="usage"]'),
+          usagePane: !!document.querySelector('.tab-pane[data-pane="usage"]'),
         };
       })()
     `);
@@ -90,6 +94,21 @@ async function main() {
       10000,
     );
     assert(patched.ok, 'renderer should receive and apply graph:patch updates');
+
+    const usageTab = await win.webContents.executeJavaScript(`
+      (() => {
+        document.querySelector('.tab[data-tab="usage"]')?.click();
+        return {
+          tab: document.querySelector('.tab[data-tab="usage"]')?.classList.contains('active') || false,
+          pane: document.querySelector('.tab-pane[data-pane="usage"]')?.classList.contains('active') || false,
+          api: typeof window.tree.getUsage === 'function',
+          text: document.querySelector('#usage-content')?.textContent || '',
+        };
+      })()
+    `);
+    assert.strictEqual(usageTab.tab, true, 'usage tab should become active');
+    assert.strictEqual(usageTab.pane, true, 'usage pane should become active');
+    assert.strictEqual(usageTab.api, true, 'usage API should be exposed');
 
     const workerResult = await win.webContents.executeJavaScript(`
       new Promise((resolve) => {
@@ -122,7 +141,13 @@ async function main() {
     assert(workerResult.ok, `worker layout should complete for large graphs: ${JSON.stringify(workerResult)}`);
 
     const pageErrors = await win.webContents.executeJavaScript(`
-      ({ title: document.title, tree: !!window.tree, graphFiles: graph.files.size, hud: document.querySelector('#hud-status')?.textContent || '' })
+      ({
+        title: document.title,
+        tree: !!window.tree,
+        graphFiles: graph.files.size,
+        hud: document.querySelector('#hud-status')?.textContent || '',
+        usage: document.querySelector('#usage-content')?.textContent || ''
+      })
     `);
     assert.strictEqual(pageErrors.tree, true, 'window.tree should be present');
     assert(pageErrors.graphFiles >= 430, 'renderer graph should contain synthetic worker-layout nodes');

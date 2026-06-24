@@ -2,14 +2,52 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
 
 permissions:
   contents: write
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      should_release: ${{ steps.v.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version and whether to release
+        id: v
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          tag="v${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          if git rev-parse "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "Tag ${tag} already exists — nothing to release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New version ${tag} — will tag and release."
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create and push tag
+        if: steps.v.outputs.should_release == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.v.outputs.tag }}"
+          git push origin "${{ steps.v.outputs.tag }}"
+
   build-mac:
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,11 +64,12 @@ jobs:
 
       - name: Create version-less aliases
         working-directory: dist
+        env:
+          V: ${{ needs.check.outputs.version }}
         run: |
           set -euo pipefail
-          v="${GITHUB_REF_NAME#v}"
-          cp "Tree-${v}-arm64.dmg" "Tree-arm64.dmg"
-          cp "Tree-${v}.dmg"        "Tree-x64.dmg"
+          cp "Tree-${V}-arm64.dmg" "Tree-arm64.dmg"
+          cp "Tree-${V}.dmg"        "Tree-x64.dmg"
           ls -la *.dmg
 
       - uses: actions/upload-artifact@v4
@@ -44,6 +83,8 @@ jobs:
           if-no-files-found: error
 
   build-win:
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -61,9 +102,10 @@ jobs:
       - name: Create version-less alias
         shell: pwsh
         working-directory: dist
+        env:
+          V: ${{ needs.check.outputs.version }}
         run: |
-          $v = $env:GITHUB_REF_NAME.TrimStart('v')
-          Copy-Item "Tree-Setup-$v.exe" "Tree-Setup.exe"
+          Copy-Item "Tree-Setup-$env:V.exe" "Tree-Setup.exe"
           Get-ChildItem *.exe
 
       - uses: actions/upload-artifact@v4
@@ -75,7 +117,8 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [build-mac, build-win]
+    needs: [check, build-mac, build-win]
+    if: needs.check.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -89,8 +132,9 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.check.outputs.tag }}
           generate_release_notes: true
-          name: "Tree IDE ${{ github.ref_name }}"
+          name: "Tree IDE ${{ needs.check.outputs.tag }}"
           files: |
             artifacts/Tree-*.dmg
             artifacts/Tree-Setup*.exe

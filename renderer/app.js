@@ -52,6 +52,15 @@ const state = {
   agents: new Map(),
   primaryAgentId: null,
   activeAgentId: null,
+  usageStats: null,
+  usageLoading: false,
+  fileEditor: {
+    rel: null,
+    original: '',
+    dirty: false,
+    saving: false,
+    truncated: false,
+  },
 };
 
 const AGENT_COLORS = [
@@ -160,14 +169,62 @@ const KIND_TO_LAYER = {
 function fileDisplayLabel(f) {
   if (!f) return '';
   if (f.kind === 'route' && f.sublabel) return `${f.label} ${f.sublabel}`;
-  if ((f.kind === 'page' || f.kind === 'layout' || f.kind === 'template') && f.sublabel) return f.sublabel;
-  if ((f.kind === 'hook' || f.kind === 'component') && f.sublabel) return f.sublabel;
+  if (f.kind === 'page' && f.sublabel) return pageDisplayLabel(f);
+  if ((f.kind === 'layout' || f.kind === 'template') && f.sublabel) return routeFileDisplayLabel(f);
+  if (f.kind === 'component') return componentDisplayLabel(f);
+  if (f.kind === 'hook' && f.sublabel) return f.sublabel;
   if (f.kind === 'special' && f.sublabel) return f.sublabel;
   if (['config', 'infra', 'docs', 'schema'].includes(f.kind) && (f.sublabel || f.filename)) {
     return f.sublabel || f.filename;
   }
   if (f.kind === 'middleware') return 'middleware';
   return f.label || f.filename || f.id;
+}
+
+function pageDisplayLabel(f) {
+  const route = f.sublabel || '';
+  const role = primaryExportName(f, 'page');
+  if (role && role !== 'Page') return `${role} ${route}`.trim();
+  return route || f.filename || f.id;
+}
+
+function routeFileDisplayLabel(f) {
+  const route = f.sublabel || '';
+  const role = primaryExportName(f, f.kind) || f.label || f.kind;
+  return `${role} ${route}`.trim();
+}
+
+function componentDisplayLabel(f) {
+  const role = primaryExportName(f, 'component') || f.sublabel || f.filename || f.id;
+  const context = componentRouteContext(f);
+  return context ? `${context}/${role}` : role;
+}
+
+function primaryExportName(f, kind) {
+  const skip = new Set([
+    'default', 'metadata', 'viewport', 'revalidate', 'dynamic', 'runtime',
+    'generateMetadata', 'generateViewport', 'generateStaticParams',
+  ]);
+  const names = (f.exports || [])
+    .map(e => e && e.name)
+    .filter(name => name && !skip.has(name) && !/Props$|Params$|Config$|Metadata$/i.test(name));
+  if (!names.length) return f.sublabel || '';
+  if (kind === 'page') {
+    return names.find(name => /(Page|Screen|View)$/i.test(name)) || names.find(name => /^[A-Z]/.test(name)) || names[0];
+  }
+  return names.find(name => /^[A-Z]/.test(name)) || names[0];
+}
+
+function componentRouteContext(f) {
+  const parts = String(f.id || '').split('/').slice(0, -1);
+  const appIdx = parts.lastIndexOf('app');
+  if (appIdx !== -1) {
+    const routeParts = parts.slice(appIdx + 1)
+      .filter(part => part && !/^\(.+\)$/.test(part))
+      .filter(part => !['components', 'component', '_components', 'ui'].includes(part));
+    if (routeParts.length) return routeParts.slice(-2).join('/');
+  }
+  return '';
 }
 
 function renderModuleList(filter = '') {
@@ -296,6 +353,7 @@ function selectFile(id) {
   if (!f) return;
   state.selected = { kind: 'file', id, label: fileDisplayLabel(f) };
   graph.selected = state.selected;
+  graph.setFocusCompact?.(id, { fit: true });
   renderFileDetail(f);
   switchTab('module');
   renderModuleList($('#filter-input').value);
@@ -304,6 +362,7 @@ function selectFile(id) {
 graph.onSelect = (hit) => {
   if (!hit) {
     state.selected = null;
+    graph.clearFocusCompact?.({ fit: true });
     renderFileDetail(null);
     return;
   }
@@ -530,6 +589,18 @@ function renderFileDetail(f) {
     </div>
   `).join('');
   const mapSignals = [];
+  if (f.kind === 'page' && f.sublabel) {
+    mapSignals.push({ label: 'Route', value: f.sublabel });
+    const role = primaryExportName(f, 'page');
+    if (role) mapSignals.push({ label: 'Page', value: role });
+  } else if (f.kind === 'component') {
+    const role = primaryExportName(f, 'component') || f.sublabel;
+    if (role) mapSignals.push({ label: 'Component', value: role });
+    const context = componentRouteContext(f);
+    if (context) mapSignals.push({ label: 'Context', value: context });
+  } else if ((f.kind === 'layout' || f.kind === 'template') && f.sublabel) {
+    mapSignals.push({ label: 'Route', value: f.sublabel });
+  }
   const gitText = gitStatusText(f.gitStatus);
   if (gitText) mapSignals.push({ label: 'Git', value: gitText });
   if (f.kind === 'table' && f.sqlStats) mapSignals.push({ label: 'SQL', value: sqlStatsText(f.sqlStats) || 'no detected SQL access' });
@@ -587,7 +658,8 @@ function renderFileDetail(f) {
       </div>
     </div>
     <div class="detail-actions">
-      <button class="ghost-btn" data-action="open">Open file</button>
+      <button class="ghost-btn" data-action="open">View code</button>
+      <button class="ghost-btn" data-action="edit">Edit code</button>
     </div>
 
     ${mapSignals.length ? `
@@ -770,8 +842,8 @@ function renderFileDetail(f) {
 
 function onFileAction(f, action) {
   const targetFile = f.parentFile || f.id;
-  if (action === 'open') {
-    loadFileViewer(targetFile);
+  if (action === 'open' || action === 'edit') {
+    loadFileViewer(targetFile, { focus: action === 'edit' });
     switchTab('file');
   }
 }
@@ -794,7 +866,8 @@ function showContextMenu(hit, x, y) {
     const id = hit.id;
     items = [
       { type: 'header', label: id },
-      { label: 'Open in viewer', action: () => { switchTab('file'); loadFileViewer(id); } },
+      { label: 'View code', action: () => { switchTab('file'); loadFileViewer(id); } },
+      { label: 'Edit code', action: () => { switchTab('file'); loadFileViewer(id, { focus: true }); } },
       { label: 'Reveal in sidebar',
         action: () => { selectFile(id); graph.panTo(id); } },
       { type: 'divider' },
@@ -862,15 +935,359 @@ function switchTab(name) {
   if (name === 'chat' && state.agents) {
     refitAgents({ focus: true });
   }
+  if (name === 'usage') {
+    renderUsagePane();
+    refreshUsage().catch(() => {});
+  }
 }
 $$('.tab').forEach(t => t.addEventListener('click', () => switchTab(t.dataset.tab)));
 
+function renderUsagePane() {
+  const content = $('#usage-content');
+  const stamp = $('#usage-stamp');
+  if (!content) return;
+  const usage = state.usageStats;
+  if (stamp) {
+    if (state.usageLoading) stamp.textContent = 'refreshing';
+    else if (!usage) stamp.textContent = 'waiting';
+    else stamp.textContent = usage.stale ? 'stale' : (usage.status || 'ready');
+  }
+  if (!usage) {
+    content.innerHTML = '<div class="usage-empty">No usage snapshot yet.</div>';
+    return;
+  }
+  const providers = [usage.providers?.codex, usage.providers?.claude].filter(Boolean);
+  content.innerHTML = `
+    <div class="usage-grid">
+      ${providers.map(renderUsageProvider).join('')}
+    </div>
+    ${renderUsageStats(usage.stats)}
+  `;
+}
+
+function renderUsageProvider(provider) {
+  const color = provider.key === 'claude' ? 'hsl(35, 32%, 74%)' : 'hsl(145, 22%, 72%)';
+  const stateName = provider.source?.state || provider.state || 'unknown';
+  const oneHour = provider.headroom?.oneHour || {};
+  const active = provider.headroom?.active ?? 0;
+  const weeklyReset = provider.windows?.weekly?.resetIso ? shortDateTime(provider.windows.weekly.resetIso) : provider.windows?.weekly?.resetText;
+  const fiveReset = provider.windows?.fiveHour?.resetIso ? shortDateTime(provider.windows.fiveHour.resetIso) : provider.windows?.fiveHour?.resetText;
+  const rows = Array.isArray(provider.headroom?.rows) ? provider.headroom.rows : [];
+  const advice = usageAdvice(provider);
+  return `
+    <section class="usage-provider" data-state="${escapeHtml(stateName)}" style="--provider-color:${color}">
+      <div class="usage-provider-head">
+        <span class="usage-provider-name">${escapeHtml(provider.label || provider.key)}</span>
+        <span class="usage-provider-state">${escapeHtml(stateName)}</span>
+      </div>
+      <div class="usage-provider-body">
+        ${renderUsageMeter('weekly', provider.quota?.weeklyUsedPercent, provider.quota?.weeklyRemainingPercent, weeklyReset)}
+        ${renderUsageMeter('5h', provider.quota?.fiveHourUsedPercent, provider.quota?.fiveHourRemainingPercent, fiveReset)}
+        <div class="usage-advice ${stateClass(advice.state)}">
+          <span class="usage-advice-label">${escapeHtml(advice.label)}</span>
+          <span class="usage-advice-text">${escapeHtml(advice.text)}</span>
+        </div>
+        <div class="usage-capacity">
+          <div class="usage-capacity-item">
+            <span class="usage-capacity-label">running now</span>
+            <span class="usage-capacity-value">${active}</span>
+          </div>
+          <div class="usage-capacity-item">
+            <span class="usage-capacity-label">add now</span>
+            <span class="usage-capacity-value ${stateClass(advice.state)}">${escapeHtml(advice.addText)}</span>
+          </div>
+          <div class="usage-capacity-item">
+            <span class="usage-capacity-label">best for</span>
+            <span class="usage-capacity-value">${escapeHtml(advice.bestFor)}</span>
+          </div>
+          <div class="usage-capacity-item">
+            <span class="usage-capacity-label">closest limit</span>
+            <span class="usage-capacity-value">${escapeHtml(advice.watch)}</span>
+          </div>
+        </div>
+        <div class="usage-sim">
+          <div class="usage-sim-head">
+            <span>time</span><span>now</span><span>caution</span><span>near cap</span>
+          </div>
+          ${rows.map(row => `
+            <div class="usage-sim-row ${stateClass(row.state)}">
+              <span class="usage-cell">${escapeHtml(row.label)}</span>
+              <span class="usage-cell">${row.active}</span>
+              <span class="usage-cell">${formatAgentCount(row.watchAgents)}</span>
+              <span class="usage-cell">${formatAgentCount(row.hardAgents)}</span>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderUsageStats(stats) {
+  const daily = Array.isArray(stats?.daily) ? stats.daily : [];
+  if (!daily.length) return '';
+  const last7 = stats.last7 || {};
+  const last28 = stats.last28 || {};
+  const peak = stats.peakDay || {};
+  const bars = daily.slice(-28);
+  const max = Math.max(1, Number(stats.maxDailyTokens) || 1, ...bars.map(row => Number(row.totalTokens) || 0));
+  const heatBlanks = Array.from({ length: Number(daily[0]?.weekday) || 0 });
+  return `
+    <section class="usage-charts">
+      <div class="usage-chart-head">
+        <span>Usage Stats</span>
+        <span class="dim">Codex + Claude</span>
+      </div>
+      <div class="usage-stat-grid">
+        ${renderUsageStat('last 7 days', formatUsageTokens(last7.totalTokens), usageSplitText(last7))}
+        ${renderUsageStat('last 28 days', formatUsageTokens(last28.totalTokens), usageSplitText(last28))}
+        ${renderUsageStat('peak day', peak.date ? formatUsageTokens(peak.totalTokens) : 'none', peak.date ? `${escapeHtml(peak.label || peak.date)}` : 'no usage')}
+      </div>
+      <div class="usage-chart-row">
+        <div class="usage-chart-box">
+          <div class="usage-chart-label">
+            <span>activity</span>
+            <span>56 days</span>
+          </div>
+          <div class="usage-heatmap" aria-label="56 day usage heatmap">
+            ${heatBlanks.map(() => '<span class="usage-heat-cell empty"></span>').join('')}
+            ${daily.map(row => `
+              <span class="usage-heat-cell level-${Math.max(0, Math.min(4, Number(row.intensity) || 0))}"
+                title="${escapeHtml(`${row.label}: ${formatUsageTokens(row.totalTokens)} total`)}"></span>
+            `).join('')}
+          </div>
+        </div>
+        <div class="usage-chart-box">
+          <div class="usage-chart-label">
+            <span>daily split</span>
+            <span>28 days</span>
+          </div>
+          <div class="usage-bars" aria-label="28 day Codex and Claude usage">
+            ${bars.map(row => renderUsageBar(row, max)).join('')}
+          </div>
+          <div class="usage-legend">
+            <span><i class="legend-codex"></i>Codex</span>
+            <span><i class="legend-claude"></i>Claude</span>
+          </div>
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderUsageStat(label, value, meta) {
+  return `
+    <div class="usage-stat">
+      <span class="usage-stat-label">${escapeHtml(label)}</span>
+      <span class="usage-stat-value">${escapeHtml(value)}</span>
+      <span class="usage-stat-meta">${escapeHtml(meta || '')}</span>
+    </div>
+  `;
+}
+
+function renderUsageBar(row, max) {
+  const total = Number(row.totalTokens) || 0;
+  const codex = Number(row.codexTokens) || 0;
+  const claude = Number(row.claudeTokens) || 0;
+  const codexPct = total > 0 ? Math.max(2, (codex / max) * 100) : 0;
+  const claudePct = total > 0 ? Math.max(2, (claude / max) * 100) : 0;
+  return `
+    <div class="usage-bar-wrap" title="${escapeHtml(`${row.label}: ${formatUsageTokens(total)} total · Codex ${formatUsageTokens(codex)} · Claude ${formatUsageTokens(claude)}`)}">
+      <div class="usage-bar">
+        ${codex ? `<span class="usage-bar-fill codex" style="height:${codexPct}%"></span>` : ''}
+        ${claude ? `<span class="usage-bar-fill claude" style="height:${claudePct}%"></span>` : ''}
+      </div>
+    </div>
+  `;
+}
+
+function renderUsageMeter(label, used, remaining, reset) {
+  const usedLabel = formatPct(used);
+  const remainingLabel = remaining == null ? 'unknown' : `${formatPct(remaining)} left`;
+  const width = clampPercent(used);
+  return `
+    <div class="usage-meter">
+      <div class="usage-meter-label">
+        <span>${escapeHtml(label)} · ${usedLabel}</span>
+        <span>${escapeHtml(remainingLabel)}${reset ? ` · ${escapeHtml(reset)}` : ''}</span>
+      </div>
+      <div class="usage-meter-track"><span class="usage-meter-fill" style="--value:${width}%"></span></div>
+    </div>
+  `;
+}
+
+function usageAdvice(provider) {
+  const label = provider.label || provider.key || 'Provider';
+  const active = Number(provider.headroom?.active || 0);
+  const oneHour = provider.headroom?.oneHour || {};
+  const under80 = Number(oneHour.watchAgents);
+  const under95 = Number(oneHour.hardAgents);
+  const add80 = Number.isFinite(under80) ? Math.max(0, under80 - active) : null;
+  const add95 = Number.isFinite(under95) ? Math.max(0, under95 - active) : null;
+  const closest = closestLimitLabel(provider);
+
+  if (provider.source?.state === 'missing' || provider.source?.state === 'error') {
+    return {
+      state: 'error',
+      label: 'No live guidance',
+      text: `Refresh TokenMax before deciding how much ${label} work to start.`,
+      addText: 'unknown',
+      bestFor: 'wait',
+      watch: closest,
+    };
+  }
+
+  if (add95 !== null && add95 <= 0) {
+    return {
+      state: 'limit',
+      label: 'Hold off',
+      text: `Do not start more ${label} agents. Let current work finish or wait for the next reset.`,
+      addText: 'none',
+      bestFor: 'finishing',
+      watch: closest,
+    };
+  }
+
+  if (add80 !== null && add80 <= 0) {
+    return {
+      state: 'watch',
+      label: 'Use lightly',
+      text: `Keep ${label} to the agents already running. New parallel work pushes into the caution zone.`,
+      addText: 'none',
+      bestFor: 'small fixes',
+      watch: closest,
+    };
+  }
+
+  if (add80 !== null && add80 <= 2) {
+    return {
+      state: 'watch',
+      label: 'Use lightly',
+      text: `Add ${agentPhrase(add80)} for short tasks, then check this page again.`,
+      addText: `+${add80}`,
+      bestFor: 'short tasks',
+      watch: closest,
+    };
+  }
+
+  if (add80 !== null && add80 <= 5) {
+    return {
+      state: 'ok',
+      label: 'Use normally',
+      text: `Good for regular work. Keep big parallel runs under ${under80} total ${label} agents for the next hour.`,
+      addText: `+${add80}`,
+      bestFor: 'normal work',
+      watch: closest,
+    };
+  }
+
+  if (add80 !== null) {
+    return {
+      state: 'ok',
+      label: 'Use heavily',
+      text: `Good for parallel work right now. You have room to add ${agentPhrase(add80)} for about an hour.`,
+      addText: `+${add80}`,
+      bestFor: 'parallel work',
+      watch: closest,
+    };
+  }
+
+  return {
+    state: 'unknown',
+    label: 'Not enough signal',
+    text: `Live limits are present, but Tree cannot estimate ${label} agent room yet.`,
+    addText: 'unknown',
+    bestFor: 'manual call',
+    watch: closest,
+  };
+}
+
+function closestLimitLabel(provider) {
+  const limiting = provider.headroom?.limitingWindow || 'unknown';
+  const weekly = formatPct(provider.quota?.weeklyUsedPercent);
+  const five = formatPct(provider.quota?.fiveHourUsedPercent);
+  if (limiting === '5h') return `${five} in 5h`;
+  if (limiting === 'weekly') return `${weekly} this week`;
+  return `5h ${five} / week ${weekly}`;
+}
+
+function agentPhrase(count) {
+  const n = Math.max(0, Math.floor(Number(count) || 0));
+  return `${n} more ${n === 1 ? 'agent' : 'agents'}`;
+}
+
+async function refreshUsage({ force = false } = {}) {
+  if (!window.tree?.getUsage || state.usageLoading) return;
+  state.usageLoading = true;
+  renderUsagePane();
+  try {
+    state.usageStats = force && window.tree.refreshUsage
+      ? await window.tree.refreshUsage({ range: '7d' })
+      : await window.tree.getUsage({ range: '7d' });
+  } catch (e) {
+    state.usageStats = {
+      ok: false,
+      status: 'error',
+      error: e.message || String(e),
+      generatedAt: new Date().toISOString(),
+      providers: {},
+    };
+  } finally {
+    state.usageLoading = false;
+    renderUsagePane();
+  }
+}
+
+function formatPct(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? `${Math.round(n)}%` : 'unknown';
+}
+function formatRate(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? `${n.toFixed(n >= 10 ? 0 : 1)}%/h` : 'unknown';
+}
+function formatAgentCount(value) {
+  return Number.isFinite(Number(value)) ? String(Math.max(0, Math.floor(Number(value)))) : 'unknown';
+}
+function formatUsageTokens(value) {
+  const n = Number(value) || 0;
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(Math.round(n));
+}
+function usageSplitText(row) {
+  const codex = Number(row?.codexTokens) || 0;
+  const claude = Number(row?.claudeTokens) || 0;
+  const total = codex + claude;
+  if (!total) return 'no usage';
+  return `Codex ${Math.round((codex / total) * 100)}% · Claude ${Math.round((claude / total) * 100)}%`;
+}
+function clampPercent(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.min(100, Math.max(0, n)) : 0;
+}
+function shortDateTime(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+}
+function stateClass(name) {
+  const stateName = String(name || 'unknown');
+  if (stateName === 'ok') return 'usage-state-ok';
+  if (stateName === 'watch' || stateName === 'partial' || stateName === 'stale') return 'usage-state-watch';
+  if (stateName === 'limit' || stateName === 'error' || stateName === 'missing') return 'usage-state-error';
+  return 'usage-state-unknown';
+}
+
 function setWorkspaceView(view, persist = true) {
-  const next = view === 'graph' ? 'graph' : 'agents';
+  const next = view === 'graph' ? 'graph' : view === 'usage' ? 'usage' : 'agents';
   state.view = next;
   document.body.classList.toggle('view-agents', next === 'agents');
+  document.body.classList.toggle('view-usage', next === 'usage');
   document.body.classList.toggle('view-graph', next === 'graph');
   $('#agents-view-btn')?.classList.toggle('active', next === 'agents');
+  $('#usage-view-btn')?.classList.toggle('active', next === 'usage');
   $('#graph-view-btn')?.classList.toggle('active', next === 'graph');
   if (persist) localStorage.setItem(VIEW_STORAGE_KEY, next);
 
@@ -881,8 +1298,16 @@ function setWorkspaceView(view, persist = true) {
     return;
   }
 
+  if (next === 'usage') {
+    graph.setPaused(true);
+    switchTab('usage');
+    refreshUsage().catch(() => {});
+    return;
+  }
+
   graph.setPaused(false);
-  if ($('.tab-pane[data-pane="chat"]')?.classList.contains('active')) {
+  if ($('.tab-pane[data-pane="chat"]')?.classList.contains('active') ||
+      $('.tab-pane[data-pane="usage"]')?.classList.contains('active')) {
     switchTab('module');
   }
   requestAnimationFrame(() => {
@@ -892,13 +1317,205 @@ function setWorkspaceView(view, persist = true) {
 }
 
 $('#agents-view-btn')?.addEventListener('click', () => setWorkspaceView('agents'));
+$('#usage-view-btn')?.addEventListener('click', () => setWorkspaceView('usage'));
 $('#graph-view-btn')?.addEventListener('click', () => setWorkspaceView('graph'));
+$('#usage-refresh')?.addEventListener('click', () => refreshUsage({ force: true }).catch(() => {}));
 
-async function loadFileViewer(rel) {
+function formatFileBytes(bytes) {
+  const n = Number(bytes) || 0;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)} MB`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)} KB`;
+  return `${n} B`;
+}
+
+function editorModeLabel(rel) {
+  const ext = (rel.split('.').pop() || '').toLowerCase();
+  const labels = {
+    js: 'JavaScript',
+    jsx: 'React',
+    ts: 'TypeScript',
+    tsx: 'React TS',
+    css: 'CSS',
+    html: 'HTML',
+    json: 'JSON',
+    md: 'Markdown',
+    py: 'Python',
+    rb: 'Ruby',
+    go: 'Go',
+    rs: 'Rust',
+    java: 'Java',
+    kt: 'Kotlin',
+    swift: 'Swift',
+    sql: 'SQL',
+    yml: 'YAML',
+    yaml: 'YAML',
+    toml: 'TOML',
+    sh: 'Shell',
+    zsh: 'Shell',
+  };
+  return labels[ext] || 'Text';
+}
+
+function renderFileEditorShell(rel, opts = {}) {
+  const {
+    status = 'Loading...',
+    content = '',
+    disabled = true,
+    truncated = false,
+    size = 0,
+    error = '',
+  } = opts;
   const v = $('#file-viewer');
-  v.textContent = 'Loading…';
-  const res = await window.tree.readFile(rel);
-  v.textContent = res.error ? ('Error: ' + res.error) : (res.content || '(empty)');
+  const mode = rel ? editorModeLabel(rel) : 'Text';
+  v.innerHTML = `
+    <div class="file-editor">
+      <div class="file-editor-toolbar">
+        <div class="file-editor-title">
+          <div class="file-editor-name">${rel ? escapeHtml(shorten(rel, 54)) : 'No file selected'}</div>
+          <div class="file-editor-meta">
+            <span>${escapeHtml(mode)}</span>
+            ${size ? `<span>${escapeHtml(formatFileBytes(size))}</span>` : ''}
+            <span id="file-editor-status">${escapeHtml(status)}</span>
+          </div>
+        </div>
+        <div class="file-editor-actions">
+          <button class="ghost-btn compact" id="file-editor-reload" ${rel ? '' : 'disabled'}>Reload</button>
+          <button class="ghost-btn compact" id="file-editor-revert" disabled>Revert</button>
+          <button class="ghost-btn compact" id="file-editor-save" disabled>Save</button>
+        </div>
+      </div>
+      ${error ? `<div class="file-editor-error">${escapeHtml(error)}</div>` : ''}
+      ${truncated ? `<div class="file-editor-warning">This file is larger than the editor limit, so it is shown read-only to avoid saving partial content.</div>` : ''}
+      <textarea
+        id="file-editor-text"
+        class="file-editor-text"
+        spellcheck="false"
+        autocomplete="off"
+        autocapitalize="off"
+        ${disabled ? 'disabled' : ''}
+      ></textarea>
+    </div>
+  `;
+  const text = $('#file-editor-text');
+  if (text) text.value = content;
+  wireFileEditorControls();
+}
+
+function setFileEditorStatus(text, tone = '') {
+  const el = $('#file-editor-status');
+  if (!el) return;
+  el.textContent = text;
+  el.className = tone ? `file-editor-status ${tone}` : 'file-editor-status';
+}
+
+function syncFileEditorButtons(opts = {}) {
+  const editor = state.fileEditor;
+  const text = $('#file-editor-text');
+  const canEdit = Boolean(editor.rel && text && !text.disabled && !editor.truncated);
+  const dirty = canEdit && text.value !== editor.original;
+  editor.dirty = dirty;
+  const save = $('#file-editor-save');
+  const revert = $('#file-editor-revert');
+  const reload = $('#file-editor-reload');
+  if (save) save.disabled = !dirty || editor.saving;
+  if (revert) revert.disabled = !dirty || editor.saving;
+  if (reload) reload.disabled = !editor.rel || editor.saving;
+  if (opts.preserveStatus) return;
+  if (editor.saving) {
+    setFileEditorStatus('saving...');
+  } else if (dirty) {
+    setFileEditorStatus('unsaved', 'dirty');
+  } else if (editor.rel && !editor.truncated) {
+    setFileEditorStatus('saved');
+  }
+}
+
+function wireFileEditorControls() {
+  const text = $('#file-editor-text');
+  const save = $('#file-editor-save');
+  const revert = $('#file-editor-revert');
+  const reload = $('#file-editor-reload');
+  if (text) {
+    text.addEventListener('input', syncFileEditorButtons);
+    text.addEventListener('keydown', (event) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
+        event.preventDefault();
+        saveFileEditor();
+      }
+    });
+  }
+  save?.addEventListener('click', saveFileEditor);
+  revert?.addEventListener('click', () => {
+    if (!text) return;
+    text.value = state.fileEditor.original;
+    syncFileEditorButtons();
+    text.focus();
+  });
+  reload?.addEventListener('click', () => {
+    if (state.fileEditor.rel) loadFileViewer(state.fileEditor.rel, { force: true });
+  });
+}
+
+async function saveFileEditor() {
+  const editor = state.fileEditor;
+  const text = $('#file-editor-text');
+  if (!editor.rel || !text || text.disabled || editor.truncated || editor.saving) return;
+  const content = text.value;
+  editor.saving = true;
+  $$('.file-editor-error').forEach(el => el.remove());
+  syncFileEditorButtons();
+  const res = await window.tree.writeFile(editor.rel, content);
+  editor.saving = false;
+  if (res.error) {
+    setFileEditorStatus('save failed', 'error');
+    const error = $('.file-editor-error');
+    if (error) error.textContent = res.error;
+    else $('.file-editor')?.insertAdjacentHTML('afterbegin', `<div class="file-editor-error">${escapeHtml(res.error)}</div>`);
+    syncFileEditorButtons({ preserveStatus: true });
+    return;
+  }
+  editor.original = content;
+  editor.dirty = false;
+  $$('.file-editor-error').forEach(el => el.remove());
+  setFileEditorStatus(`saved ${new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`);
+  syncFileEditorButtons({ preserveStatus: true });
+}
+
+async function loadFileViewer(rel, opts = {}) {
+  if (!rel) return;
+  if (!opts.force && state.fileEditor.dirty && state.fileEditor.rel && state.fileEditor.rel !== rel) {
+    const discard = window.confirm(`${state.fileEditor.rel} has unsaved edits. Discard them and open ${rel}?`);
+    if (!discard) return;
+  }
+
+  state.fileEditor = {
+    rel,
+    original: '',
+    dirty: false,
+    saving: false,
+    truncated: false,
+  };
+  renderFileEditorShell(rel, { status: 'Loading...' });
+  const res = await window.tree.readFile(rel, { maxChars: 1_500_000 });
+  if (state.fileEditor.rel !== rel) return;
+  if (res.error) {
+    renderFileEditorShell(rel, {
+      status: 'error',
+      error: res.error,
+      disabled: true,
+    });
+    return;
+  }
+  state.fileEditor.original = res.content || '';
+  state.fileEditor.truncated = Boolean(res.truncated);
+  renderFileEditorShell(rel, {
+    status: res.truncated ? 'read-only' : 'saved',
+    content: res.content || '',
+    disabled: Boolean(res.truncated),
+    truncated: Boolean(res.truncated),
+    size: res.size,
+  });
+  if (opts.focus && !res.truncated) $('#file-editor-text')?.focus();
 }
 
 async function syncFreshAgentsToRepo() {
@@ -938,6 +1555,7 @@ async function openRepo(forcePath) {
   renderModuleList();
   renderFileDetail(null);
   syncFreshAgentsToRepo().catch(() => {});
+  refreshUsage().catch(() => {});
   const stampEl = $('#stamp-sub');
   if (stampEl) stampEl.textContent = shorten(p);
   const mappedNodes = [...graph.files.values()].filter(f => f.kind !== 'external');
@@ -1587,6 +2205,10 @@ window.tree.onPtyExit(({ agentId, exitCode, signal }) => {
   agent.dom.dot.classList.remove('running');
   agent.dom.activity.textContent = `exited ${exitCode != null ? `(${exitCode})` : signal ? `[${signal}]` : ''}`;
   if (agent.term) agent.term.writeln(`\r\n\x1b[2m[exited]\x1b[0m`);
+});
+window.tree.onUsageUpdate?.((snapshot) => {
+  state.usageStats = snapshot;
+  renderUsagePane();
 });
 
 // ===== Filesystem watcher → graph + ledger =====

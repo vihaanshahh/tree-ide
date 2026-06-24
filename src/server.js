@@ -94,7 +94,8 @@ function buildRouter(backend) {
   return {
     openFolder:       ()                 => backend.openFolder(),
     scanRepo:         (root)             => backend.scanRepo(root),
-    readFile:         (rel)              => backend.readFile(rel),
+    readFile:         (rel, opts)        => backend.readFile(rel, opts),
+    writeFile:        (rel, content)     => backend.writeFile(rel, content),
     detectProviders:  ()                 => backend.detectProviders(),
     getStartupRoot:   ()                 => backend.getStartupRoot(),
     watchFs:          (root)             => backend.watchFs(root),
@@ -106,6 +107,8 @@ function buildRouter(backend) {
     ptyResize:        (agentId, c, r)    => { backend.ptyResize(agentId, c, r); },
     ptyKill:          (agentId)          => backend.ptyKill(agentId),
     launchAgent:      (payload)          => backend.launchAgent(payload),
+    getUsage:         (payload)          => backend.getUsage(payload),
+    refreshUsage:     (payload)          => backend.refreshUsage(payload),
 
     checkUpdate:      ()                 => backend.checkUpdate(),
     relaunchApp:      ()                 => backend.relaunchApp(),
@@ -117,6 +120,7 @@ function buildRouter(backend) {
 const BROADCAST_EVENTS = [
   'pty:data', 'pty:exit',
   'fs:event',
+  'usage:update',
   'graph:patch',
   'repo:scan-progress',
   'app:open-root',

@@ -112,7 +112,7 @@ function buildModuleAdjacency(fileEdges, filesMap, modOf, moduleIds) {
     const b = modOf(tf);
     if (a === b || !moduleIds.has(a) || !moduleIds.has(b)) continue;
     const inner = out.get(a);
-    inner.set(b, (inner.get(b) || 0) + 1);
+    inner.set(b, (inner.get(b) || 0) + edgeTypeWeight(e));
   }
   return out;
 }
@@ -138,8 +138,213 @@ function computeModuleTiers(out, moduleIds) {
   return tier;
 }
 
+function edgeTypeWeight(e) {
+  if (!e) return 1;
+  if (e.type === 'db-query') return 7;
+  if (e.type === 'api-call') return 6;
+  if (e.type === 'endpoint-internal') return 4;
+  if (e.type === 'fk') return 3;
+  if (e.type === 'import') return e.transitive ? 0.35 : 1;
+  return e.transitive ? 0.25 : 1;
+}
+
+function baseFeatureScore(f, { matchSet, activeFileIds } = {}) {
+  let score = 0;
+  if (f.gitStatus && f.gitStatus.dirty) score += f.gitStatus.untracked ? 12 : 16;
+  if (activeFileIds && activeFileIds.has(f.id)) score += 18;
+  if (matchSet && matchSet.has(f.id)) score += 14;
+  return score;
+}
+
+function computeFeatureScores(files, edges, opts = {}) {
+  const filesMap = files instanceof Map ? files : new Map(files.map(f => [f.id, f]));
+  const base = new Map();
+  for (const f of filesMap.values()) {
+    const score = baseFeatureScore(f, opts);
+    if (score) base.set(f.id, score);
+  }
+  const scores = new Map(base);
+  for (const e of edges || []) {
+    const sf = filesMap.get(e.source);
+    const tf = filesMap.get(e.target);
+    if (!sf || !tf || sf.hidden || tf.hidden) continue;
+    const w = edgeTypeWeight(e);
+    const sourceScore = base.get(e.source) || 0;
+    const targetScore = base.get(e.target) || 0;
+    if (sourceScore) scores.set(e.target, (scores.get(e.target) || 0) + sourceScore * w * 0.16);
+    if (targetScore) scores.set(e.source, (scores.get(e.source) || 0) + targetScore * w * 0.12);
+  }
+  return scores;
+}
+
+function modulePairWeight(out, a, b) {
+  if (!out || !a || !b || a === b) return 0;
+  return (out.get(a)?.get(b) || 0) + (out.get(b)?.get(a) || 0);
+}
+
+function orderModulesByFeatureFlow(modules, out) {
+  if (modules.length <= 2) return modules.slice();
+  const remaining = new Map(modules.map(mod => [mod.id, mod]));
+  const ordered = [];
+  const moduleRank = (mod) => (
+    (mod._featureScore || 0) * 7 +
+    (mod._componentScore || 0) * 2.2 +
+    Math.log2((mod._score || 0) + 1) * 10 +
+    mod.files.length * 0.35
+  );
+  const pickBest = (scoreFor) => {
+    let best = null;
+    let bestScore = -Infinity;
+    for (const mod of remaining.values()) {
+      const score = scoreFor(mod);
+      if (score > bestScore || (score === bestScore && best && mod.id.localeCompare(best.id) < 0)) {
+        best = mod;
+        bestScore = score;
+      }
+    }
+    if (best) remaining.delete(best.id);
+    return best;
+  };
+
+  const first = pickBest(moduleRank);
+  if (first) ordered.push(first);
+
+  while (remaining.size) {
+    const last = ordered[ordered.length - 1];
+    const next = pickBest((mod) => {
+      let placedConnection = 0;
+      for (const placed of ordered) placedConnection += modulePairWeight(out, mod.id, placed.id);
+      const lastConnection = last ? modulePairWeight(out, mod.id, last.id) : 0;
+      const tierDistance = last ? Math.abs((mod._tier || 0) - (last._tier || 0)) : 0;
+      return placedConnection * 54 + lastConnection * 32 + moduleRank(mod) - tierDistance * 0.7;
+    });
+    if (next) ordered.push(next);
+  }
+  return ordered;
+}
+
+function packModulePicture(modules, { xGap, yGap, topPad, targetAspect = 1.08, translate }) {
+  if (!modules.length) return;
+  if (modules.length === 1) {
+    translate(modules[0], 0, topPad);
+    return;
+  }
+
+  const totalArea = modules.reduce((sum, mod) => sum + (mod._panelW + xGap) * (mod._panelH + yGap), 0);
+  const maxPanelW = Math.max(...modules.map(mod => mod._panelW));
+  const naturalW = Math.sqrt(Math.max(1, totalArea) * targetAspect);
+  const minTargetW = Math.max(maxPanelW, naturalW * 0.68);
+  const maxTargetW = Math.max(minTargetW, naturalW * 1.42);
+  let best = null;
+
+  const packAtWidth = (targetW) => {
+    const rows = [];
+    let row = { mods: [], w: 0, h: 0 };
+    for (const mod of modules) {
+      const nextW = row.mods.length ? row.w + xGap + mod._panelW : mod._panelW;
+      if (row.mods.length && nextW > targetW) {
+        rows.push(row);
+        row = { mods: [], w: 0, h: 0 };
+      }
+      row.mods.push(mod);
+      row.w = row.mods.length === 1 ? mod._panelW : nextW;
+      row.h = Math.max(row.h, mod._panelH);
+    }
+    if (row.mods.length) rows.push(row);
+    const w = Math.max(...rows.map(r => r.w));
+    const h = rows.reduce((sum, r) => sum + r.h, 0) + yGap * Math.max(0, rows.length - 1);
+    const aspect = w / Math.max(1, h);
+    const aspectPenalty = Math.abs(Math.log(aspect / targetAspect));
+    const lonelyRows = rows.filter(r => r.mods.length === 1).length;
+    const rowPenalty = Math.abs(rows.length - Math.sqrt(modules.length)) * 0.035;
+    const lonelyPenalty = lonelyRows / modules.length * 0.22;
+    return { rows, w, h, score: aspectPenalty + rowPenalty + lonelyPenalty };
+  };
+
+  for (let i = 0; i < 18; i++) {
+    const t = i / 17;
+    const candidate = packAtWidth(minTargetW + (maxTargetW - minTargetW) * t);
+    if (!best || candidate.score < best.score) best = candidate;
+  }
+
+  let y = topPad;
+  for (const row of best.rows) {
+    let x = -row.w / 2;
+    for (const mod of row.mods) {
+      translate(mod, x, y);
+      x += mod._panelW + xGap;
+    }
+    y += row.h + yGap;
+  }
+}
+
 function displayLabel(f) {
+  if (!f) return '';
+  if (f.kind === 'route' && f.sublabel) return `${f.label} ${f.sublabel}`;
+  if (f.kind === 'page' && f.sublabel) return pageDisplayLabel(f);
+  if ((f.kind === 'layout' || f.kind === 'template') && f.sublabel) return routeFileDisplayLabel(f);
+  if (f.kind === 'component') return componentDisplayLabel(f);
+  if (f.kind === 'hook' && f.sublabel) return f.sublabel;
+  if (['config', 'infra', 'docs', 'schema'].includes(f.kind) && (f.sublabel || f.filename)) {
+    return f.sublabel || f.filename;
+  }
+  const generic = ['store', 'job', 'service', 'server-action', 'test', 'styles', 'model'];
+  if (generic.includes(f.kind)) {
+    const name = f.sublabel || (f.filename ? f.filename.replace(/\.[^.]+$/, '') : '') || f.id;
+    const genericNames = new Set(['index', 'main', 'route', 'server', 'app', 'handler', 'router']);
+    if (genericNames.has(String(name).toLowerCase()) && f.dir) {
+      const folder = f.dir.split('/').pop();
+      if (folder) return `${folder}/${name}`;
+    }
+    return name;
+  }
   return f.label || f.filename || f.id;
+}
+
+function pageDisplayLabel(f) {
+  const route = f.sublabel || '';
+  const role = primaryExportName(f, 'page');
+  if (role && role !== 'Page') return `${role} ${route}`.trim();
+  return route || f.filename || f.id;
+}
+
+function routeFileDisplayLabel(f) {
+  const route = f.sublabel || '';
+  const role = primaryExportName(f, f.kind) || f.label || f.kind;
+  return `${role} ${route}`.trim();
+}
+
+function componentDisplayLabel(f) {
+  const role = primaryExportName(f, 'component') || f.sublabel || f.filename || f.id;
+  const context = componentRouteContext(f);
+  return context ? `${context}/${role}` : role;
+}
+
+function primaryExportName(f, kind) {
+  const skip = new Set([
+    'default', 'metadata', 'viewport', 'revalidate', 'dynamic', 'runtime',
+    'generateMetadata', 'generateViewport', 'generateStaticParams',
+  ]);
+  const names = (f.exports || [])
+    .map(e => e && e.name)
+    .filter(name => name && !skip.has(name) && !/Props$|Params$|Config$|Metadata$/i.test(name));
+  if (!names.length) return f.sublabel || '';
+  if (kind === 'page') {
+    return names.find(name => /(Page|Screen|View)$/i.test(name)) || names.find(name => /^[A-Z]/.test(name)) || names[0];
+  }
+  return names.find(name => /^[A-Z]/.test(name)) || names[0];
+}
+
+function componentRouteContext(f) {
+  const parts = String(f.id || '').split('/').slice(0, -1);
+  const appIdx = parts.lastIndexOf('app');
+  if (appIdx !== -1) {
+    const routeParts = parts.slice(appIdx + 1)
+      .filter(part => part && !/^\(.+\)$/.test(part))
+      .filter(part => !['components', 'component', '_components', 'ui'].includes(part));
+    if (routeParts.length) return routeParts.slice(-2).join('/');
+  }
+  return '';
 }
 
 function estimateTextWidth(text, size = 12) {
@@ -172,6 +377,7 @@ function wrapLabel(text, maxWidth, maxLines) {
 function performLayout(nodes, edges, opts = {}) {
   const visibleKinds = new Set(opts.visibleKinds || []);
   const matchSet = new Set(opts.matchSet || []);
+  const activeFileIds = new Set(opts.activeFileIds || []);
   const expandedTables = new Set(opts.expandedTables || []);
   const importance = new Map(opts.importance || []);
   const topPad = Number(opts.topPad || 108);
@@ -195,19 +401,25 @@ function performLayout(nodes, edges, opts = {}) {
 
   const n = allVisible.length;
   const density = n <= 80 ? 'small' : n <= 320 ? 'medium' : 'large';
-  const pillMinW = density === 'small' ? 112 : density === 'medium' ? 92 : 82;
-  const pillMaxW = density === 'small' ? 360 : density === 'medium' ? 320 : 280;
-  const pillH = density === 'small' ? 32 : 28;
+  const featureScores = computeFeatureScores(new Map(allVisible.map(f => [f.id, f])), edges, {
+    matchSet,
+    activeFileIds,
+  });
+  for (const f of allVisible) f._featureScore = featureScores.get(f.id) || 0;
+  const pillPadX = 18;
+  const pillMinW = density === 'small' ? 132 : density === 'medium' ? 118 : 104;
+  const pillMaxW = density === 'small' ? 460 : density === 'medium' ? 420 : 380;
+  const pillH = density === 'small' ? 36 : 34;
   const labelLineH = 14;
-  const itemGap = 8;
-  const rowGap = 10;
-  const sectionHeadH = 26;
-  const sectionGap = 22;
-  const panelPadX = 14;
-  const panelPadTop = 32;
-  const panelPadBottom = 14;
-  const modXGap = density === 'small' ? 56 : 44;
-  const modYGap = density === 'small' ? 64 : 56;
+  const itemGap = 14;
+  const rowGap = 16;
+  const sectionHeadH = 30;
+  const sectionGap = 32;
+  const panelPadX = 20;
+  const panelPadTop = 40;
+  const panelPadBottom = 22;
+  const modXGap = density === 'small' ? 84 : 72;
+  const modYGap = density === 'small' ? 88 : 76;
 
   const measureLabel = (f) => {
     if (f.kind === 'table') {
@@ -215,7 +427,7 @@ function performLayout(nodes, edges, opts = {}) {
       for (const c of f.columns || []) width = Math.max(width, estimateTextWidth(`${c.name} ${c.type}`, 11) + 56);
       return width;
     }
-    return Math.min(pillMaxW, estimateTextWidth(displayLabel(f), 12) + 32);
+    return Math.min(pillMaxW, estimateTextWidth(displayLabel(f), 12) + pillPadX * 2);
   };
 
   const modDepth = pickModuleDepth(allVisible);
@@ -243,11 +455,26 @@ function performLayout(nodes, edges, opts = {}) {
     for (const kind of orderedKinds) {
       const arr = byKind.get(kind);
       if (kind === 'endpoint') {
-        arr.sort((a, b) => endpointPathOf(a).localeCompare(endpointPathOf(b)) || endpointVerbRank(a) - endpointVerbRank(b));
+        arr.sort((a, b) => {
+          const fa = a._featureScore || 0;
+          const fb = b._featureScore || 0;
+          if (fa !== fb) return fb - fa;
+          return endpointPathOf(a).localeCompare(endpointPathOf(b)) || endpointVerbRank(a) - endpointVerbRank(b);
+        });
       } else if (kind === 'table') {
-        arr.sort((a, b) => String(a.label || '').localeCompare(String(b.label || '')));
+        arr.sort((a, b) => {
+          const fa = a._featureScore || 0;
+          const fb = b._featureScore || 0;
+          if (fa !== fb) return fb - fa;
+          return String(a.label || '').localeCompare(String(b.label || ''));
+        });
       } else {
-        arr.sort((a, b) => (importance.get(b.id) || 0) - (importance.get(a.id) || 0) || displayLabel(a).localeCompare(displayLabel(b)));
+        arr.sort((a, b) => {
+          const fa = a._featureScore || 0;
+          const fb = b._featureScore || 0;
+          if (fa !== fb) return fb - fa;
+          return (importance.get(b.id) || 0) - (importance.get(a.id) || 0) || displayLabel(a).localeCompare(displayLabel(b));
+        });
       }
     }
 
@@ -258,7 +485,7 @@ function performLayout(nodes, edges, opts = {}) {
     widths.sort((a, b) => a - b);
     const median = widths.length ? widths[Math.floor(widths.length / 2)] : pillMinW;
     const maxWidth = widths.length ? widths[widths.length - 1] : pillMinW;
-    const targetCols = Math.max(1, Math.min(3, Math.round(Math.sqrt(mod.files.length) / 1.8)));
+    const targetCols = Math.max(1, Math.min(2, Math.round(Math.sqrt(mod.files.length) / 2.4)));
     const innerW = Math.ceil(Math.max(pillMinW, maxWidth, median * targetCols + itemGap * (targetCols - 1)));
     const panelW = innerW + panelPadX * 2;
     const sections = [];
@@ -316,12 +543,17 @@ function performLayout(nodes, edges, opts = {}) {
         f._endpointVerb = '';
         f._importance = importance.get(f.id) || 0;
         let w = Math.max(pillMinW, Math.min(pillMaxW, measureLabel(f)));
-        w = Math.min(pillMaxW, Math.ceil(w + Math.min(32, Math.log2(f._importance + 1) * 5)));
+        w = Math.min(pillMaxW, Math.ceil(w + Math.min(44, Math.log2(f._importance + 1) * 6)));
         if (w > section.w) w = section.w;
-        f._labelLines = wrapLabel(displayLabel(f), Math.max(20, w - 32), f.kind === 'endpoint' ? 3 : 2);
+        const maxLabelLines = (f.kind === 'endpoint' || f.kind === 'page' || f.kind === 'component') ? 3 : 2;
+        f._labelLines = wrapLabel(displayLabel(f), Math.max(20, w - pillPadX * 2), maxLabelLines);
+        const decisionMetaH = f.kind === 'endpoint' ? 0 : 14;
         return {
           w,
-          h: Math.max(f.kind === 'endpoint' ? 48 : pillH, f._labelLines.length * labelLineH + 14 + (f.kind === 'endpoint' ? 16 : 0)),
+          h: Math.max(
+            f.kind === 'endpoint' ? 48 : pillH + decisionMetaH,
+            f._labelLines.length * labelLineH + 14 + (f.kind === 'endpoint' ? 16 : decisionMetaH),
+          ),
         };
       };
 
@@ -377,60 +609,37 @@ function performLayout(nodes, edges, opts = {}) {
 
   const modOut = buildModuleAdjacency(edges, filesMap, modOf, moduleIds);
   const tier = computeModuleTiers(modOut, moduleIds);
-  const byTier = new Map();
   for (const mod of moduleMap.values()) {
-    const t = tier.get(mod.id) || 0;
-    if (!byTier.has(t)) byTier.set(t, []);
-    byTier.get(t).push(mod);
+    mod._tier = tier.get(mod.id) || 0;
+    mod._score = mod.files.reduce((sum, f) => sum + (importance.get(f.id) || 0), 0);
+    mod._featureScore = mod.files.reduce((sum, f) => sum + (f._featureScore || 0), 0);
+    mod._componentScore = mod.files.reduce((sum, f) => {
+      return sum + (['page', 'component', 'hook', 'store'].includes(f.kind) ? (importance.get(f.id) || 1) : 0);
+    }, 0);
   }
 
-  const placedCenterX = new Map();
-  let yCursor = topPad;
-  for (const t of [...byTier.keys()].sort((a, b) => a - b)) {
-    const rowMods = byTier.get(t);
-    if (t === 0) {
-      rowMods.sort((a, b) => b.files.length - a.files.length || a.id.localeCompare(b.id));
-    } else {
-      for (const mod of rowMods) {
-        let sum = 0;
-        let count = 0;
-        for (const otherId of placedCenterX.keys()) {
-          const fromOther = modOut.get(otherId);
-          const fromSelf = modOut.get(mod.id);
-          if ((fromOther && fromOther.has(mod.id)) || (fromSelf && fromSelf.has(otherId))) {
-            sum += placedCenterX.get(otherId);
-            count++;
-          }
-        }
-        mod._barycenter = count ? sum / count : 0;
-      }
-      const orig = new Map(rowMods.map((m, i) => [m.id, i]));
-      rowMods.sort((a, b) => a._barycenter - b._barycenter || orig.get(a.id) - orig.get(b.id));
-    }
-
-    const rowW = rowMods.reduce((sum, m) => sum + m._panelW, 0) + modXGap * Math.max(0, rowMods.length - 1);
-    let xCursor = -rowW / 2;
-    let rowH = 0;
-    for (const mod of rowMods) {
+  const orderedModules = orderModulesByFeatureFlow([...moduleMap.values()], modOut);
+  packModulePicture(orderedModules, {
+    xGap: modXGap,
+    yGap: modYGap,
+    topPad,
+    targetAspect: 1.08,
+    translate: (mod, x, y) => {
       for (const section of mod.sections) {
-        section.x += xCursor;
-        section.y += yCursor;
+        section.x += x;
+        section.y += y;
         for (const id of section.fileIds) {
           const f = filesMap.get(id);
           if (f) {
-            f.x += xCursor;
-            f.y += yCursor;
+            f.x += x;
+            f.y += y;
           }
         }
       }
-      mod.x = xCursor;
-      mod.y = yCursor;
-      placedCenterX.set(mod.id, xCursor + mod._panelW / 2);
-      xCursor += mod._panelW + modXGap;
-      rowH = Math.max(rowH, mod._panelH);
-    }
-    yCursor += rowH + modYGap;
-  }
+      mod.x = x;
+      mod.y = y;
+    },
+  });
 
   return {
     nodes,

@@ -145,7 +145,8 @@
   window.tree = {
     openFolder,
     scanRepo:        (root) => request('scanRepo', [root]),
-    readFile:        (rel)  => request('readFile', [rel]),
+    readFile:        (rel, opts = {}) => request('readFile', [rel, opts]),
+    writeFile:       (rel, content) => request('writeFile', [rel, content]),
     detectProviders: ()     => request('detectProviders', []),
     getStartupRoot:  ()     => request('getStartupRoot', []),
     watchFs:         (root) => request('watchFs', [root]),
@@ -155,6 +156,8 @@
     ptyResize:       (agentId, cols, rows) => notify('ptyResize', [agentId, cols, rows]),
     ptyKill:         (agentId)            => request('ptyKill', [agentId]),
     launchAgent:     (payload)            => request('launchAgent', [payload]),
+    getUsage:        (payload = {})       => request('getUsage', [payload]),
+    refreshUsage:    (payload = {})       => request('refreshUsage', [payload]),
 
     checkUpdate:        ()                => request('checkUpdate', []),
     relaunchApp:        ()                => request('relaunchApp', []),
@@ -163,6 +166,7 @@
     onPtyData:        (cb) => on('pty:data', cb),
     onPtyExit:        (cb) => on('pty:exit', cb),
     onFsEvent:        (cb) => on('fs:event', cb),
+    onUsageUpdate:    (cb) => on('usage:update', cb),
     onGraphPatch:     (cb) => on('graph:patch', cb),
     onScanProgress:   (cb) => on('repo:scan-progress', cb),
     onOpenRoot:       (cb) => on('app:open-root', cb),

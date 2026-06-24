@@ -20,6 +20,7 @@ const { EventEmitter } = require('events');
 const { spawn, execSync } = require('child_process');
 const chokidar = require('chokidar');
 const { buildGraph } = require('./scanner');
+const { UsageService } = require('./usage/service');
 
 const FS_SKIP = [
   '**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**',
@@ -158,6 +159,8 @@ class Backend {
     this.currentRoot = null;
     this.fsWatcher = null;
     this.ptyAgents = new Map();
+    this.usage = opts.usageService || new UsageService(opts.usage || {});
+    this.usageUpdateTimer = null;
     // Set by main.js when running inside Electron; lets us still expose
     // app-level features (folder picker, relaunch) over the RPC channel
     // when the host process can implement them.
@@ -174,6 +177,17 @@ class Backend {
   // -------------------------------------------------------------------
   // Repo scan + file read
   // -------------------------------------------------------------------
+  resolveRepoFile(relPath) {
+    if (!this.currentRoot) return { error: 'No repo loaded' };
+    if (typeof relPath !== 'string' || !relPath.trim()) return { error: 'Missing file path' };
+    if (path.isAbsolute(relPath)) return { error: 'Path escapes root' };
+
+    const root = path.resolve(this.currentRoot);
+    const full = path.resolve(root, relPath);
+    if (full !== root && !full.startsWith(root + path.sep)) return { error: 'Path escapes root' };
+    return { root, full };
+  }
+
   async scanRepo(rootPath) {
     if (!rootPath || !fs.existsSync(rootPath)) return { error: 'Path does not exist' };
     if (isTooBroad(rootPath)) {
@@ -184,7 +198,7 @@ class Backend {
     try {
       const graph = await buildGraph(rootPath, {
         concurrency: 64,
-        includeFnEdges: false,
+        includeFnEdges: true,
         onProgress: (done, total) => {
           if (done === total || done % 50 === 0) {
             this.events.emit('repo:scan-progress', { status: 'reading', done, total });
@@ -200,13 +214,35 @@ class Backend {
     }
   }
 
-  async readFile(relPath) {
-    if (!this.currentRoot) return { error: 'No repo loaded' };
-    const full = path.join(this.currentRoot, relPath);
-    if (!full.startsWith(this.currentRoot)) return { error: 'Path escapes root' };
+  async readFile(relPath, opts = {}) {
+    const resolved = this.resolveRepoFile(relPath);
+    if (resolved.error) return { error: resolved.error };
     try {
-      const content = fs.readFileSync(full, 'utf8');
-      return { content: content.length > 200_000 ? content.slice(0, 200_000) : content };
+      const content = fs.readFileSync(resolved.full, 'utf8');
+      const maxChars = Math.max(1, Number(opts?.maxChars) || 200_000);
+      const truncated = content.length > maxChars;
+      return {
+        content: truncated ? content.slice(0, maxChars) : content,
+        truncated,
+        size: Buffer.byteLength(content, 'utf8'),
+      };
+    } catch (e) {
+      return { error: e.message };
+    }
+  }
+
+  async writeFile(relPath, content) {
+    const resolved = this.resolveRepoFile(relPath);
+    if (resolved.error) return { error: resolved.error };
+    if (typeof content !== 'string') return { error: 'File content must be text' };
+    try {
+      fs.writeFileSync(resolved.full, content, 'utf8');
+      this.scheduleGraphPatch('change');
+      return {
+        ok: true,
+        size: Buffer.byteLength(content, 'utf8'),
+        savedAt: new Date().toISOString(),
+      };
     } catch (e) {
       return { error: e.message };
     }
@@ -227,6 +263,49 @@ class Backend {
   setStartupRoot(root) {
     this.startupRoot = normalizeOpenRoot(root);
     if (this.startupRoot) this.events.emit('app:open-root', { root: this.startupRoot });
+  }
+
+  usageAgentsSnapshot() {
+    const now = Date.now();
+    return [...this.ptyAgents.entries()].map(([id, r]) => ({
+      id,
+      provider: r.provider,
+      cwd: r.cwd,
+      program: r.program,
+      pid: r.term?.pid || null,
+      ageSeconds: r.startedAt ? Math.max(0, (now - r.startedAt) / 1000) : null,
+      lastOutputAgeSeconds: r.lastOutputAt ? Math.max(0, (now - r.lastOutputAt) / 1000) : null,
+    }));
+  }
+
+  async getUsage(payload = {}) {
+    return this.usage.snapshot({
+      range: payload?.range || '7d',
+      force: Boolean(payload?.force),
+      agents: this.usageAgentsSnapshot(),
+    });
+  }
+
+  async refreshUsage(payload = {}) {
+    return this.getUsage({ ...payload, force: true });
+  }
+
+  scheduleUsageUpdate(force = false) {
+    clearTimeout(this.usageUpdateTimer);
+    this.usageUpdateTimer = setTimeout(async () => {
+      this.usageUpdateTimer = null;
+      try {
+        this.events.emit('usage:update', await this.getUsage({ force }));
+      } catch (e) {
+        this.events.emit('usage:update', {
+          ok: false,
+          status: 'error',
+          generatedAt: new Date().toISOString(),
+          error: e.message || String(e),
+          activeAgents: this.usageAgentsSnapshot(),
+        });
+      }
+    }, 250);
   }
 
   // -------------------------------------------------------------------
@@ -288,7 +367,7 @@ class Backend {
     try {
       const graph = await buildGraph(root, {
         concurrency: 64,
-        includeFnEdges: false,
+        includeFnEdges: true,
         onProgress: (done, total) => {
           if (done === total || done % 100 === 0) {
             this.events.emit('repo:scan-progress', { status: 'patching', done, total });
@@ -368,12 +447,18 @@ class Backend {
       return { error: `Failed to spawn ${provider}: ${e.message}` };
     }
 
-    this.ptyAgents.set(agentId, { term, provider, cwd, program });
-    term.onData((data) => this.events.emit('pty:data', { agentId, data }));
+    const record = { term, provider, cwd, program, startedAt: Date.now(), lastOutputAt: 0 };
+    this.ptyAgents.set(agentId, record);
+    term.onData((data) => {
+      if (data) record.lastOutputAt = Date.now();
+      this.events.emit('pty:data', { agentId, data });
+    });
     term.onExit(({ exitCode, signal }) => {
       this.ptyAgents.delete(agentId);
       this.events.emit('pty:exit', { agentId, exitCode, signal });
+      this.scheduleUsageUpdate(false);
     });
+    this.scheduleUsageUpdate(false);
     return { ok: true, provider, program, cwd, pid: term.pid };
   }
 
@@ -394,6 +479,7 @@ class Backend {
     if (!r) return { error: 'no such agent' };
     try { r.term.kill(); } catch {}
     this.ptyAgents.delete(agentId);
+    this.scheduleUsageUpdate(false);
     return { ok: true };
   }
 
@@ -508,6 +594,7 @@ class Backend {
   // Lifecycle
   // -------------------------------------------------------------------
   shutdown() {
+    clearTimeout(this.usageUpdateTimer);
     for (const [, r] of this.ptyAgents) { try { r.term.kill(); } catch {} }
     this.ptyAgents.clear();
     if (this.fsWatcher) {
