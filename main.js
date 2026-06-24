@@ -138,9 +138,27 @@ function getAppIcon() {
   return APP_ICON;
 }
 
-let mainWindow = null;
-let serverHandle = null;
-let backend = null;
+// Multi-window: each window owns its own Backend + embedded server so it can
+// map a different repo independently. A "record" bundles that per-window state:
+//   { win, backend, server, localServerUrl, sshChild }
+// Module-level singletons are gone — everything is looked up per window.
+const windows = new Set();
+
+function recordForWebContents(wc) {
+  const win = wc ? BrowserWindow.fromWebContents(wc) : null;
+  if (!win) return null;
+  for (const r of windows) if (r.win === win) return r;
+  return null;
+}
+
+function focusedRecord() {
+  const win = BrowserWindow.getFocusedWindow();
+  if (win) for (const r of windows) if (r.win === win) return r;
+  // Fall back to the most recently opened window if none is focused.
+  let last = null;
+  for (const r of windows) last = r;
+  return last;
+}
 
 function parseOpenRootArg(argv) {
   const args = (argv || []).slice(1);
@@ -168,11 +186,14 @@ if (!gotSingleInstanceLock) {
 
 if (gotSingleInstanceLock) {
   app.on('second-instance', (_event, argv) => {
+    // A second `tree-ide --open <repo>` invocation opens that repo in a new
+    // window instead of hijacking an existing one. With no path, just focus.
     const root = parseOpenRootArg(argv);
-    if (root && backend) backend.setStartupRoot(root);
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.focus();
+    if (root) { createWindow(root); return; }
+    const r = focusedRecord();
+    if (r && r.win) {
+      if (r.win.isMinimized()) r.win.restore();
+      r.win.focus();
     }
   });
 }
@@ -190,7 +211,11 @@ function setupAutoUpdater() {
   autoUpdaterReady = true;
   autoUpdater.autoDownload = false;          // download only when the user clicks
   autoUpdater.autoInstallOnAppQuit = true;
-  const emit = (payload) => { try { backend?.events.emit('app:update-progress', payload); } catch {} };
+  // electron-updater is a process-global singleton; fan its progress out to
+  // every open window so whichever one triggered the update sees it.
+  const emit = (payload) => {
+    for (const r of windows) { try { r.backend?.events.emit('app:update-progress', payload); } catch {} }
+  };
   autoUpdater.on('download-progress', (p) => emit({ status: 'downloading', percent: Math.round(p.percent || 0) }));
   autoUpdater.on('update-downloaded', () => {
     emit({ status: 'relaunching' });
@@ -199,11 +224,17 @@ function setupAutoUpdater() {
   autoUpdater.on('error', (err) => emit({ status: 'error', error: String(err?.message || err) }));
 }
 
-function buildElectronHooks() {
+// getRecord() returns the per-window record this backend belongs to, so the
+// hooks can target the right BrowserWindow / emit on the right backend.
+function buildElectronHooks(getRecord) {
+  const emitProgress = (payload) => {
+    try { getRecord()?.backend?.events.emit('app:update-progress', payload); } catch {}
+  };
   return {
     openFolder: async () => {
-      if (!mainWindow) return null;
-      const result = await dialog.showOpenDialog(mainWindow, {
+      const win = getRecord()?.win;
+      if (!win) return null;
+      const result = await dialog.showOpenDialog(win, {
         properties: ['openDirectory'],
         title: 'Open repo to map',
       });
@@ -234,14 +265,14 @@ function buildElectronHooks() {
         }
         try {
           setupAutoUpdater();
-          backend.events.emit('app:update-progress', { status: 'fetching' });
+          emitProgress({ status: 'fetching' });
           const result = await autoUpdater.checkForUpdates();
           if (!result || !result.updateInfo) return { error: 'No update metadata found on the release.' };
-          backend.events.emit('app:update-progress', { status: 'downloading', percent: 0 });
+          emitProgress({ status: 'downloading', percent: 0 });
           await autoUpdater.downloadUpdate();   // 'update-downloaded' triggers quitAndInstall
           return { ok: true };
         } catch (e) {
-          backend.events.emit('app:update-progress', { status: 'error', error: String(e?.message || e) });
+          emitProgress({ status: 'error', error: String(e?.message || e) });
           // Fall back to the releases page so the user can still grab the build.
           try { await shell.openExternal(`https://github.com/${UPDATE_REPO}/releases/latest`); } catch {}
           return { error: e?.message || String(e) };
@@ -255,13 +286,13 @@ function buildElectronHooks() {
         child.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`${cmd} exited ${code}: ${stderr.trim()}`)));
       });
       try {
-        backend.events.emit('app:update-progress', { status: 'fetching' });
+        emitProgress({ status: 'fetching' });
         await run('git', ['fetch', '--tags', '--quiet']);
-        backend.events.emit('app:update-progress', { status: 'pulling' });
+        emitProgress({ status: 'pulling' });
         await run('git', ['pull', '--ff-only', '--quiet']);
-        backend.events.emit('app:update-progress', { status: 'installing' });
+        emitProgress({ status: 'installing' });
         await run('npm', ['install', '--no-audit', '--no-fund', '--silent']);
-        backend.events.emit('app:update-progress', { status: 'relaunching' });
+        emitProgress({ status: 'relaunching' });
         app.relaunch();
         app.exit(0);
         return { ok: true };
@@ -280,8 +311,9 @@ function isGitCheckout() {
 // Kept around for the (unlikely) preload-only IPC path. The renderer
 // resolves window.electronNative.pickFolder via this. Server-side it
 // resolves through the Backend hook above; both paths are equivalent.
-ipcMain.handle('dialog:openFolder', async () => {
-  const result = await dialog.showOpenDialog(mainWindow, {
+ipcMain.handle('dialog:openFolder', async (event) => {
+  const win = recordForWebContents(event.sender)?.win || BrowserWindow.getFocusedWindow();
+  const result = await dialog.showOpenDialog(win, {
     properties: ['openDirectory'],
     title: 'Open repo to map',
   });
@@ -298,13 +330,13 @@ ipcMain.handle('dialog:openFolder', async () => {
 // BrowserWindow to it. The tunnel + token check is the whole security
 // boundary, same as the CLI workflow documented in the README.
 // =======================================================================
-let currentSshChild = null;
-let localServerUrl = null; // First URL we ever loaded — used to "Disconnect"
-
-function killCurrentSsh() {
-  if (!currentSshChild) return;
-  const child = currentSshChild;
-  currentSshChild = null;
+// SSH tunnels are per-window: record.sshChild holds the active `ssh -L …`
+// child for that window, and record.localServerUrl is the local URL to
+// navigate back to on disconnect.
+function killSsh(record) {
+  if (!record || !record.sshChild) return;
+  const child = record.sshChild;
+  record.sshChild = null;
   try { child.kill('SIGTERM'); } catch {}
 }
 
@@ -323,8 +355,10 @@ function pickFreePort() {
 // POSIX-safe single-quoting for a shell-string passed through ssh.
 const shq = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'";
 
-ipcMain.handle('ssh:connect', async (_e, opts) => {
-  killCurrentSsh();
+ipcMain.handle('ssh:connect', async (event, opts) => {
+  const record = recordForWebContents(event.sender);
+  if (!record) return { error: 'No window for this SSH request.' };
+  killSsh(record);
   const host       = (opts && opts.host       || '').trim();
   const remotePath = (opts && opts.path       || '').trim();
   const identity   = (opts && opts.identity   || '').trim();
@@ -357,7 +391,7 @@ ipcMain.handle('ssh:connect', async (_e, opts) => {
     } catch (e) {
       return resolve({ error: 'Failed to spawn ssh: ' + (e.message || e) });
     }
-    currentSshChild = child;
+    record.sshChild = child;
 
     let stdout = '', stderr = '';
     let settled = false;
@@ -373,7 +407,7 @@ ipcMain.handle('ssh:connect', async (_e, opts) => {
       if (settled) return;
       settled = true;
       try { child.kill('SIGTERM'); } catch {}
-      if (currentSshChild === child) currentSshChild = null;
+      if (record.sshChild === child) record.sshChild = null;
       resolve({ error: msg });
     };
 
@@ -393,13 +427,13 @@ ipcMain.handle('ssh:connect', async (_e, opts) => {
     });
     child.on('error', (e) => finishErr('Failed to spawn ssh: ' + (e.message || e)));
     child.on('exit', (code, sig) => {
-      if (currentSshChild === child) currentSshChild = null;
+      if (record.sshChild === child) record.sshChild = null;
       if (!settled) {
         const tail = (stderr || stdout).trim().split('\n').slice(-4).join('\n').slice(-500);
         finishErr(`ssh exited (code ${code}${sig ? `, signal ${sig}` : ''}).\n${tail || 'No output.'}`);
-      } else if (mainWindow && !mainWindow.isDestroyed()) {
+      } else if (record.win && !record.win.isDestroyed()) {
         // Tunnel died after we navigated. Tell the renderer so it can toast.
-        try { mainWindow.webContents.send('ssh:gone', { code, sig }); } catch {}
+        try { record.win.webContents.send('ssh:gone', { code, sig }); } catch {}
       }
     });
 
@@ -412,19 +446,45 @@ ipcMain.handle('ssh:connect', async (_e, opts) => {
   });
 });
 
-ipcMain.handle('ssh:disconnect', async () => {
-  killCurrentSsh();
-  if (mainWindow && localServerUrl) {
-    try { mainWindow.loadURL(localServerUrl); } catch {}
+ipcMain.handle('ssh:disconnect', async (event) => {
+  const record = recordForWebContents(event.sender);
+  if (!record) return { ok: true };
+  killSsh(record);
+  if (record.win && record.localServerUrl) {
+    try { record.win.loadURL(record.localServerUrl); } catch {}
   }
   return { ok: true };
 });
 
 // =======================================================================
 // Window
+//
+// Each window is fully self-contained: its own Backend + embedded HTTP/WS
+// server, so it can map a different repo than its siblings. `openRoot`, if
+// given, becomes that backend's startup root and the renderer auto-scans it.
 // =======================================================================
-function createWindow() {
-  mainWindow = new BrowserWindow({
+async function createWindow(openRoot = null) {
+  const record = { win: null, backend: null, server: null, localServerUrl: null, sshChild: null };
+  windows.add(record);
+
+  // Boot this window's backend + server before loading the page so the
+  // renderer never sees a half-initialized state.
+  try {
+    record.backend = new Backend({
+      startupRoot: normalizeOpenRoot(openRoot) || null,
+      pkg,
+      updateRepo: UPDATE_REPO,
+      electronHooks: buildElectronHooks(() => record),
+    });
+    record.server = await startServer({ backend: record.backend, host: '127.0.0.1', port: 0 });
+  } catch (e) {
+    console.error('[tree] failed to start window backend/server:', e);
+    windows.delete(record);
+    return null;
+  }
+  console.log(`[tree] embedded server: ${record.server.url}`);
+
+  const win = new BrowserWindow({
     width: 1500,
     height: 950,
     minWidth: 900,
@@ -440,47 +500,51 @@ function createWindow() {
       sandbox: false,
     },
   });
+  record.win = win;
 
-  // The page is served by our embedded HTTP server. Token is appended
-  // so the page's transport.js can authenticate its WebSocket on load.
-  if (!serverHandle) {
-    console.error('[tree] server handle missing — refusing to open a window.');
-    return;
-  }
-  localServerUrl = `http://127.0.0.1:${serverHandle.port}/?token=${encodeURIComponent(serverHandle.token)}`;
-  mainWindow.loadURL(localServerUrl);
+  // The page is served by this window's embedded HTTP server. Token is
+  // appended so transport.js can authenticate its WebSocket on load.
+  record.localServerUrl = `http://127.0.0.1:${record.server.port}/?token=${encodeURIComponent(record.server.token)}`;
+  win.loadURL(record.localServerUrl);
 
   // Diagnostics: catch renderer death (crashed/killed/oom/launch-failed)
   // and stalls. Without these, a fullscreen-triggered renderer kill just
   // looks like a blank window with no trail.
-  mainWindow.webContents.on('render-process-gone', (_e, details) => {
+  win.webContents.on('render-process-gone', (_e, details) => {
     console.error('[tree] renderer gone:', details && details.reason, 'exitCode:', details && details.exitCode);
   });
-  mainWindow.webContents.on('unresponsive', () => {
+  win.webContents.on('unresponsive', () => {
     console.warn('[tree] renderer unresponsive');
   });
-  mainWindow.webContents.on('responsive', () => {
+  win.webContents.on('responsive', () => {
     console.log('[tree] renderer responsive again');
   });
 
+  // Tear down this window's backend + server (and any SSH tunnel) when it
+  // closes, so windows don't leak watchers, PTYs, or listening ports.
+  win.on('closed', () => {
+    killSsh(record);
+    try { record.backend?.shutdown(); } catch {}
+    try { record.server?.close(); } catch {}
+    windows.delete(record);
+  });
+
   if (process.argv.includes('--devtools') || process.env.TREE_DEVTOOLS === '1') {
-    mainWindow.webContents.openDevTools({ mode: 'detach' });
+    win.webContents.openDevTools({ mode: 'detach' });
   }
+  return record;
 }
 
-// =======================================================================
-// Boot — start backend + server before opening any window so the
-// renderer never sees a half-initialized state.
-// =======================================================================
-async function boot() {
-  backend = new Backend({
-    startupRoot,
-    pkg,
-    updateRepo: UPDATE_REPO,
-    electronHooks: buildElectronHooks(),
-  });
-  serverHandle = await startServer({ backend, host: '127.0.0.1', port: 0 });
-  console.log(`[tree] embedded server: ${serverHandle.url}`);
+// Prompt for a folder (parented to the focused window) and open it in a new
+// window. Cancelling the picker still opens an empty window.
+async function newWindowWithPicker() {
+  const parent = BrowserWindow.getFocusedWindow();
+  const opts = { properties: ['openDirectory'], title: 'Open repo in new window' };
+  const result = parent
+    ? await dialog.showOpenDialog(parent, opts)
+    : await dialog.showOpenDialog(opts);
+  const root = (!result.canceled && result.filePaths[0]) ? result.filePaths[0] : null;
+  return createWindow(root);
 }
 
 if (gotSingleInstanceLock) app.whenReady().then(async () => {
@@ -488,25 +552,29 @@ if (gotSingleInstanceLock) app.whenReady().then(async () => {
   if (process.platform === 'darwin' && app.dock) {
     try { app.dock.setIcon(getAppIcon()); } catch {}
   }
-  await boot();
   setupAutoUpdater();
-  createWindow();
+  await createWindow(startupRoot);
   const isMac = process.platform === 'darwin';
   const template = [
     ...(isMac ? [{ role: 'appMenu' }] : []),
     {
       label: 'File',
       submenu: [
+        { label: 'New Window', accelerator: 'CmdOrCtrl+N', click: () => { createWindow(); } },
+        { label: 'Open Repo in New Window…', accelerator: 'CmdOrCtrl+Shift+N', click: () => { newWindowWithPicker(); } },
+        { type: 'separator' },
         { label: 'Open Repo…', accelerator: 'CmdOrCtrl+O', click: () => {
-          if (backend) backend.events.emit('menu:open-folder', {});
+          focusedRecord()?.backend.events.emit('menu:open-folder', {});
         } },
         { label: 'Connect Remote…', accelerator: 'CmdOrCtrl+Shift+R', click: () => {
-          if (backend) backend.events.emit('menu:open-ssh', {});
+          focusedRecord()?.backend.events.emit('menu:open-ssh', {});
         } },
         { label: 'Disconnect Remote', click: () => {
-          killCurrentSsh();
-          if (mainWindow && localServerUrl) {
-            try { mainWindow.loadURL(localServerUrl); } catch {}
+          const r = focusedRecord();
+          if (!r) return;
+          killSsh(r);
+          if (r.win && r.localServerUrl) {
+            try { r.win.loadURL(r.localServerUrl); } catch {}
           }
         } },
         { type: 'separator' },
@@ -527,14 +595,21 @@ if (gotSingleInstanceLock) app.whenReady().then(async () => {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 });
 
-app.on('window-all-closed', async () => {
-  killCurrentSsh();
-  if (backend) try { backend.shutdown(); } catch {}
-  if (serverHandle) try { await serverHandle.close(); } catch {}
+// Per-window cleanup happens in each window's 'closed' handler. On non-mac,
+// closing the last window quits the app (macOS keeps it running, dockable).
+app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
-app.on('before-quit', killCurrentSsh);
+// Belt-and-suspenders: ensure every window's backend/server/SSH is torn down
+// on quit, even if a 'closed' event didn't fire.
+app.on('before-quit', () => {
+  for (const r of windows) {
+    killSsh(r);
+    try { r.backend?.shutdown(); } catch {}
+    try { r.server?.close(); } catch {}
+  }
+});
 
 app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) createWindow();
