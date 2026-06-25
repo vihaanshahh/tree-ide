@@ -1,7 +1,7 @@
 {
   "name": "tree-ide",
   "productName": "Tree",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Tree — a graph-first IDE (long: Tree IDE) that maps any repo into a live blueprint and runs agents alongside it.",
   "main": "main.js",
   "type": "commonjs",
