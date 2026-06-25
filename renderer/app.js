@@ -54,6 +54,8 @@ const state = {
   activeAgentId: null,
   usageStats: null,
   usageLoading: false,
+  usageProgress: null,
+  usageProgressDisplay: 0,
   fileEditor: {
     rel: null,
     original: '',
@@ -269,7 +271,7 @@ function renderModuleList(filter = '') {
         if (state.selected && state.selected.kind === 'file' && state.selected.id === file.id) row.classList.add('selected');
         const hue = kindHue(k);
         const flags = [];
-        if (file.gitStatus && file.gitStatus.dirty) flags.push(file.gitStatus.untracked ? 'G?' : 'G');
+        if (fileHasOpenGitChange(file)) flags.push(file.gitStatus.untracked ? 'G?' : file.gitStatus.unpushed && !file.gitStatus.dirty ? 'G↑' : 'G');
         row.innerHTML = `
           <span class="file-stripe" style="background: hsl(${hue},70%,55%)"></span>
           <span class="file-node-label">${escapeHtml(fileDisplayLabel(file))}</span>
@@ -479,12 +481,14 @@ function renderFileDetail(f) {
   const internalOut = (endpointId) => sortEdges(bySource(endpointId, 'endpoint-internal'), 'out');
   const apiMeta = (e) => [e.apiMethod, e.apiPath, e.via ? `via ${labelOf(e.via)}` : ''].filter(Boolean).join(' · ');
   const gitStatusText = (s) => {
-    if (!s || !s.dirty) return '';
+    if (!s || (!s.dirty && !s.unpushed)) return '';
+    if (s.unpushed && !s.dirty) return 'unpushed';
     if (s.untracked) return 'untracked';
     if (s.deleted) return 'deleted';
     const parts = [];
     if (s.staged) parts.push('staged');
     if (s.unstaged) parts.push('unstaged');
+    if (s.unpushed) parts.push('unpushed');
     return parts.length ? `${parts.join(' + ')} (${String(s.code || '').trim() || 'M'})` : 'modified';
   };
   const sqlStatsText = (st) => {
@@ -948,20 +952,93 @@ function renderUsagePane() {
   if (!content) return;
   const usage = state.usageStats;
   if (stamp) {
-    if (state.usageLoading) stamp.textContent = 'refreshing';
+    if (state.usageLoading) {
+      const pct = Math.round(state.usageProgress?.pct || 0);
+      stamp.textContent = pct ? `refreshing ${pct}%` : 'refreshing';
+    }
     else if (!usage) stamp.textContent = 'waiting';
     else stamp.textContent = usage.stale ? 'stale' : (usage.status || 'ready');
   }
+  const loadingBar = state.usageLoading ? renderUsageLoading(state.usageProgress) : '';
   if (!usage) {
-    content.innerHTML = '<div class="usage-empty">No usage snapshot yet.</div>';
+    content.innerHTML = state.usageLoading
+      ? loadingBar + renderUsageSkeleton()
+      : '<div class="usage-empty">No usage snapshot yet.</div>';
     return;
   }
   const providers = [usage.providers?.codex, usage.providers?.claude].filter(Boolean);
   content.innerHTML = `
+    ${loadingBar}
     <div class="usage-grid">
       ${providers.map(renderUsageProvider).join('')}
     </div>
     ${renderUsageStats(usage.stats)}
+  `;
+}
+
+// The first snapshot can take ~50s (it captures live Claude + Codex limits via
+// their CLIs), so show real per-stage progress streamed from the backend rather
+// than a bare spinner.
+function renderUsageLoading(progress) {
+  const pct = usageDisplayPct();
+  const label = progress?.label || 'Reading Codex and Claude usage…';
+  return `
+    <div class="usage-loading" role="status" aria-live="polite">
+      <div class="usage-loading-row">
+        <span class="usage-spinner" aria-hidden="true"></span>
+        <span class="usage-loading-label">${escapeHtml(label)}</span>
+        <span class="usage-loading-pct">${pct}%</span>
+      </div>
+      <div class="usage-progress"><div class="usage-progress-fill" style="width:${pct}%"></div></div>
+      <div class="usage-loading-hint">First read can take up to a minute while it captures live Claude &amp; Codex limits.</div>
+    </div>
+  `;
+}
+
+function usageDisplayPct() {
+  return Math.max(4, Math.min(100, Math.round(state.usageProgressDisplay || 0)));
+}
+
+// Stage events arrive sparsely (the Claude capture alone is a ~25s gap), so we
+// ease the bar upward between them toward — but never reaching — the next
+// stage, so it always looks like it's making headway. Real stage events snap
+// the floor up; completion jumps it to 100.
+let usageProgressTimer = null;
+function startUsageProgressAnim() {
+  stopUsageProgressAnim();
+  usageProgressTimer = setInterval(() => {
+    const target = Number(state.usageProgress?.pct) || 8;
+    const ceil = Math.min(96, target + 14);
+    const cur = state.usageProgressDisplay || 0;
+    state.usageProgressDisplay = cur + (ceil - cur) * 0.06;
+    paintUsageProgress();
+  }, 200);
+}
+function stopUsageProgressAnim() {
+  if (usageProgressTimer) { clearInterval(usageProgressTimer); usageProgressTimer = null; }
+}
+function paintUsageProgress() {
+  const fill = $('#usage-content .usage-progress-fill');
+  const pctEl = $('#usage-content .usage-loading-pct');
+  const stamp = $('#usage-stamp');
+  const pct = usageDisplayPct();
+  if (fill) fill.style.width = `${pct}%`;
+  if (pctEl) pctEl.textContent = `${pct}%`;
+  if (stamp && state.usageLoading) stamp.textContent = `refreshing ${pct}%`;
+}
+
+function renderUsageSkeleton() {
+  return `
+    <div class="usage-grid">
+      ${[0, 1].map(() => `
+        <section class="usage-provider usage-skeleton" aria-hidden="true">
+          <div class="usage-skel-line w40"></div>
+          <div class="usage-skel-bar"></div>
+          <div class="usage-skel-bar"></div>
+          <div class="usage-skel-line w70"></div>
+        </section>
+      `).join('')}
+    </div>
   `;
 }
 
@@ -972,7 +1049,6 @@ function renderUsageProvider(provider) {
   const active = provider.headroom?.active ?? 0;
   const weeklyReset = provider.windows?.weekly?.resetIso ? shortDateTime(provider.windows.weekly.resetIso) : provider.windows?.weekly?.resetText;
   const fiveReset = provider.windows?.fiveHour?.resetIso ? shortDateTime(provider.windows.fiveHour.resetIso) : provider.windows?.fiveHour?.resetText;
-  const rows = Array.isArray(provider.headroom?.rows) ? provider.headroom.rows : [];
   const advice = usageAdvice(provider);
   return `
     <section class="usage-provider" data-state="${escapeHtml(stateName)}" style="--provider-color:${color}">
@@ -1004,19 +1080,6 @@ function renderUsageProvider(provider) {
             <span class="usage-capacity-label">closest limit</span>
             <span class="usage-capacity-value">${escapeHtml(advice.watch)}</span>
           </div>
-        </div>
-        <div class="usage-sim">
-          <div class="usage-sim-head">
-            <span>time</span><span>now</span><span>caution</span><span>near cap</span>
-          </div>
-          ${rows.map(row => `
-            <div class="usage-sim-row ${stateClass(row.state)}">
-              <span class="usage-cell">${escapeHtml(row.label)}</span>
-              <span class="usage-cell">${row.active}</span>
-              <span class="usage-cell">${formatAgentCount(row.watchAgents)}</span>
-              <span class="usage-cell">${formatAgentCount(row.hardAgents)}</span>
-            </div>
-          `).join('')}
         </div>
       </div>
     </section>
@@ -1219,7 +1282,10 @@ function agentPhrase(count) {
 async function refreshUsage({ force = false } = {}) {
   if (!window.tree?.getUsage || state.usageLoading) return;
   state.usageLoading = true;
+  state.usageProgress = null;
+  state.usageProgressDisplay = 6;
   renderUsagePane();
+  startUsageProgressAnim();
   try {
     state.usageStats = force && window.tree.refreshUsage
       ? await window.tree.refreshUsage({ range: '7d' })
@@ -1233,7 +1299,10 @@ async function refreshUsage({ force = false } = {}) {
       providers: {},
     };
   } finally {
+    stopUsageProgressAnim();
     state.usageLoading = false;
+    state.usageProgress = null;
+    state.usageProgressDisplay = 0;
     renderUsagePane();
   }
 }
@@ -1245,9 +1314,6 @@ function formatPct(value) {
 function formatRate(value) {
   const n = Number(value);
   return Number.isFinite(n) ? `${n.toFixed(n >= 10 ? 0 : 1)}%/h` : 'unknown';
-}
-function formatAgentCount(value) {
-  return Number.isFinite(Number(value)) ? String(Math.max(0, Math.floor(Number(value)))) : 'unknown';
 }
 function formatUsageTokens(value) {
   const n = Number(value) || 0;
@@ -1312,7 +1378,7 @@ function setWorkspaceView(view, persist = true) {
   }
   requestAnimationFrame(() => {
     graph.refreshSize({ fit: !state.selected });
-    if (state.graphStale && state.root) scheduleRescan(0);
+    if (state.root && (state.graphStale || state.files.some(fileHasOpenGitChange))) scheduleRescan(0);
   });
 }
 
@@ -1559,10 +1625,10 @@ async function openRepo(forcePath) {
   const stampEl = $('#stamp-sub');
   if (stampEl) stampEl.textContent = shorten(p);
   const mappedNodes = [...graph.files.values()].filter(f => f.kind !== 'external');
-  const dirtyCount = mappedNodes.filter(f => f.gitStatus && f.gitStatus.dirty).length;
+  const pendingCount = mappedNodes.filter(fileHasOpenGitChange).length;
   const sqlWriteCount = mappedNodes.filter(f => f.kind === 'table' && f.sqlStats && f.sqlStats.write).length;
   const stackText = result.stackSummary && result.stackSummary.length ? ` · ${result.stackSummary.slice(0, 5).join('/')}` : '';
-  $('#hud-status').textContent = `${result.fileCount} files · ${mappedNodes.length} nodes · ${graph.layers.length} layers · ${dirtyCount} dirty · ${sqlWriteCount} SQL writes${stackText}`;
+  $('#hud-status').textContent = `${result.fileCount} files · ${mappedNodes.length} nodes · ${graph.layers.length} layers · ${pendingCount} pending · ${sqlWriteCount} SQL writes${stackText}`;
 
 }
 
@@ -1571,6 +1637,11 @@ function shorten(p) {
   const parts = p.split('/');
   if (parts.length <= 3) return p;
   return '…/' + parts.slice(-2).join('/');
+}
+
+function fileHasOpenGitChange(file) {
+  const s = file && file.gitStatus;
+  return !!(s && (s.dirty || s.unpushed));
 }
 
 $('#open-folder-btn').addEventListener('click', () => openRepo());
@@ -2219,6 +2290,14 @@ window.tree.onUsageUpdate?.((snapshot) => {
   state.usageStats = snapshot;
   renderUsagePane();
 });
+// Live progress stages for the in-flight snapshot. Only repaint while the pane
+// is actively loading so background refreshes don't flash the progress bar.
+window.tree.onUsageProgress?.((evt) => {
+  state.usageProgress = evt || null;
+  const pct = Number(evt?.pct);
+  if (Number.isFinite(pct)) state.usageProgressDisplay = Math.max(state.usageProgressDisplay || 0, pct);
+  if (state.usageLoading) renderUsagePane();
+});
 
 // ===== Filesystem watcher → graph + ledger =====
 // File events update the canvas immediately with cheap local hints. The backend
@@ -2407,7 +2486,7 @@ function renderKindFilter() {
     frag.appendChild(pill);
   }
   const signals = [
-    { key: 'dirty', label: 'Dirty', count: [...graph.files.values()].filter(f => f.gitStatus && f.gitStatus.dirty).length },
+    { key: 'git', label: 'Pending', count: [...graph.files.values()].filter(fileHasOpenGitChange).length },
     { key: 'write', label: 'SQL writes', count: [...graph.files.values()].filter(f => f.kind === 'table' && f.sqlStats && f.sqlStats.write).length },
   ].filter(s => s.count);
   for (const s of signals) {

@@ -121,6 +121,7 @@ const BROADCAST_EVENTS = [
   'pty:data', 'pty:exit',
   'fs:event',
   'usage:update',
+  'usage:progress',
   'graph:patch',
   'repo:scan-progress',
   'app:open-root',

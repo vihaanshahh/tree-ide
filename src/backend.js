@@ -283,6 +283,9 @@ class Backend {
       range: payload?.range || '7d',
       force: Boolean(payload?.force),
       agents: this.usageAgentsSnapshot(),
+      // Push live "reading Codex / reading Claude / …" stages to the renderer so
+      // the (slow, ~50s cold) snapshot shows real progress instead of a spinner.
+      onProgress: (evt) => this.events.emit('usage:progress', evt),
     });
   }
 

@@ -1,21 +1,30 @@
 const http = require('http');
 const https = require('https');
+const engine = require('./tokenmax/engine');
 
-const DEFAULT_TOKENMAX_URL = process.env.TREE_TOKENMAX_URL || process.env.TOKENMAX_URL || 'http://127.0.0.1:3010';
+// TokenMax now ships inside tree-ide: usage is computed in-process by the
+// embedded engine, so nothing needs to run on a separate port. An explicit
+// TREE_TOKENMAX_URL / TOKENMAX_URL still routes to a remote TokenMax instead
+// (e.g. when serving over SSH), but that's an opt-in override, not the default.
+const EXPLICIT_TOKENMAX_URL = process.env.TREE_TOKENMAX_URL || process.env.TOKENMAX_URL || null;
 const DEFAULT_TIMEOUT_MS = clampNumber(process.env.TREE_USAGE_TIMEOUT_MS, 60000, 1000, 90000);
 const CACHE_MS = clampNumber(process.env.TREE_USAGE_CACHE_MS, 15000, 1000, 120000);
 
 class UsageService {
   constructor(opts = {}) {
-    this.tokenmaxUrl = opts.tokenmaxUrl || DEFAULT_TOKENMAX_URL;
+    const explicitUrl = opts.tokenmaxUrl || EXPLICIT_TOKENMAX_URL || null;
+    // Embedded engine is the default; a URL override flips us to HTTP mode.
+    this.useEngine = !explicitUrl;
+    this.tokenmaxUrl = explicitUrl || 'embedded';
     this.timeoutMs = opts.timeoutMs || DEFAULT_TIMEOUT_MS;
     this.cacheMs = opts.cacheMs || CACHE_MS;
     this.lastSnapshot = null;
     this.lastFetchAt = 0;
     this.inflight = null;
+    if (this.useEngine && opts.dataDir) engine.configure({ dataDir: opts.dataDir });
   }
 
-  async snapshot({ agents = [], force = false, range = '7d' } = {}) {
+  async snapshot({ agents = [], force = false, range = '7d', onProgress = null } = {}) {
     const now = Date.now();
     if (!force && this.lastSnapshot && now - this.lastFetchAt < this.cacheMs) {
       return this.withAgents(this.lastSnapshot, agents, false);
@@ -30,7 +39,7 @@ class UsageService {
       }
     }
 
-    this.inflight = this.fetchTokenMax(range)
+    this.inflight = this.fetchTokenMax(range, onProgress)
       .then((payload) => {
         const snapshot = buildTreeUsageSnapshot(payload, {
           tokenmaxUrl: this.tokenmaxUrl,
@@ -93,7 +102,15 @@ class UsageService {
     };
   }
 
-  fetchTokenMax(range) {
+  fetchTokenMax(range, onProgress = null) {
+    if (this.useEngine) {
+      // Same payload shape the standalone TokenMax /api/usage endpoint returned,
+      // so buildTreeUsageSnapshot consumes it unchanged.
+      return engine.buildUsagePayload(
+        engine.getRange(range || '7d'),
+        typeof onProgress === 'function' ? onProgress : undefined,
+      );
+    }
     const url = new URL('/api/usage', this.tokenmaxUrl);
     url.searchParams.set('range', range || '7d');
     return getJson(url, this.timeoutMs);

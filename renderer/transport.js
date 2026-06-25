@@ -167,6 +167,7 @@
     onPtyExit:        (cb) => on('pty:exit', cb),
     onFsEvent:        (cb) => on('fs:event', cb),
     onUsageUpdate:    (cb) => on('usage:update', cb),
+    onUsageProgress:  (cb) => on('usage:progress', cb),
     onGraphPatch:     (cb) => on('graph:patch', cb),
     onScanProgress:   (cb) => on('repo:scan-progress', cb),
     onOpenRoot:       (cb) => on('app:open-root', cb),

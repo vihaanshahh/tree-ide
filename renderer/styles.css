@@ -628,8 +628,7 @@ body.view-usage .usage-grid {
   border-left-color: #c8b072;
 }
 .usage-provider-head,
-.usage-row,
-.usage-sim-row {
+.usage-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 12px;
@@ -736,33 +735,76 @@ body.view-usage .usage-grid {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.usage-sim {
-  border-top: 1px solid var(--color-ghost-sand-line);
-  padding-top: 8px;
+/* Loading / progress shown while the (slow) first snapshot is fetched. */
+.usage-loading {
+  border: 1px solid var(--color-ghost-sand-line);
+  padding: 12px;
+  margin-bottom: 14px;
 }
-.usage-sim-head,
-.usage-sim-row {
-  grid-template-columns: 44px repeat(3, minmax(0, 1fr));
-}
-.usage-sim-head {
-  display: grid;
+.usage-loading-row {
+  display: flex;
+  align-items: center;
   gap: 8px;
-  color: var(--color-ghost-sand-dim);
-  text-transform: uppercase;
-  padding-bottom: 6px;
+  font-size: 12px;
 }
-.usage-sim-row {
-  gap: 8px;
-  padding: 5px 0;
-  border-top: 1px solid rgba(231, 222, 209, 0.06);
-}
-.usage-sim-row:first-of-type { border-top: none; }
-.usage-cell {
+.usage-loading-label {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--color-ghost-sand);
 }
+.usage-loading-pct {
+  color: var(--color-ghost-sand-dim);
+  font-variant-numeric: tabular-nums;
+}
+.usage-loading-hint {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--color-ghost-sand-dim);
+}
+.usage-spinner {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+  border: 2px solid var(--color-ghost-sand-line);
+  border-top-color: var(--color-ghost-sand);
+  border-radius: 50%;
+  animation: usage-spin 0.8s linear infinite;
+}
+.usage-progress {
+  margin-top: 8px;
+  height: 4px;
+  background: var(--color-ghost-sand-line);
+  overflow: hidden;
+}
+.usage-progress-fill {
+  height: 100%;
+  background: var(--color-ghost-sand);
+  transition: width 0.3s ease;
+}
+@keyframes usage-spin { to { transform: rotate(360deg); } }
+.usage-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+}
+.usage-skel-line,
+.usage-skel-bar {
+  background: linear-gradient(90deg,
+    var(--color-ghost-sand-line) 25%,
+    rgba(231, 222, 209, 0.12) 37%,
+    var(--color-ghost-sand-line) 63%);
+  background-size: 400% 100%;
+  animation: usage-shimmer 1.4s ease infinite;
+}
+.usage-skel-line { height: 10px; }
+.usage-skel-line.w40 { width: 40%; }
+.usage-skel-line.w70 { width: 70%; }
+.usage-skel-bar { height: 22px; }
+@keyframes usage-shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
 .usage-state-ok { color: #9ab18d; }
 .usage-state-watch { color: #c8b072; }
 .usage-state-limit,
