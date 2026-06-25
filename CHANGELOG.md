@@ -2,13 +2,15 @@
 
 All notable changes to Tree IDE.
 
-## [0.4.3] - 2026-06-25
+## [0.4.4] - 2026-06-25
 
 ### Fixed
 
 - macOS builds are now code-signed with a Developer ID and notarized, so the
   in-app "Update & restart" auto-update works on macOS (Squirrel.Mac rejects
   unsigned updates) and downloaded DMGs open without a Gatekeeper warning.
+- CI builds the Intel (x64) mac on the `macos-15-intel` runner; the old
+  `macos-13` runner was retired by GitHub in Dec 2025.
 
 ## [0.4.2] - 2026-06-24
 
