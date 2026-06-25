@@ -2,6 +2,28 @@
 
 All notable changes to Tree IDE.
 
+## [0.4.5] - 2026-06-25
+
+### Added
+
+- **Usage panel works out of the box.** The token-usage / quota engine
+  (TokenMax) is now embedded and runs in-process, so the Usage panel no longer
+  depends on a separate service being started manually — it just works. Live
+  Claude and Codex limits, weekly/5h quota meters, and history are all built in.
+- New agent shortcut.
+
+### Changed
+
+- The Usage panel now streams real per-stage loading progress (the first read
+  can take up to a minute while it captures live limits) instead of a bare
+  spinner, and the cryptic agent-capacity simulation table was removed.
+
+### Fixed
+
+- Usage no longer reads "unavailable" when launched from Finder: the embedded
+  engine resolves the `claude` / `codex` CLIs via a login-shell PATH probe, so
+  version-managed installs (nvm/fnm/etc.) are found in packaged builds.
+
 ## [0.4.4] - 2026-06-25
 
 ### Fixed
