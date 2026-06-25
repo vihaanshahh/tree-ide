@@ -2011,6 +2011,18 @@ function createAgent({ label, primary = false, provider = 'shell' } = {}) {
   return agent;
 }
 
+function createUserAgent({ provider = 'shell' } = {}) {
+  const agent = createAgent({ label: `Agent ${state.agents.size + 1}`, provider });
+  if (!agent) return null;
+  setActiveAgent(agent.id);
+  setWorkspaceView('agents');
+  requestAnimationFrame(() => {
+    if (agent.fitAddon) try { agent.fitAddon.fit(); } catch {}
+    if (agent.term) try { agent.term.focus(); } catch {}
+  });
+  return agent;
+}
+
 function beginRenameAgent(agent) {
   const span = agent.dom.name;
   if (!span || span.dataset.editing === '1') return;
@@ -2266,9 +2278,7 @@ ensurePrimaryAgent();
 
 const newAgentBtn = $('#new-agent-btn');
 if (newAgentBtn) {
-  newAgentBtn.addEventListener('click', () => {
-    createAgent({ label: `Agent ${state.agents.size + 1}`, provider: 'shell' });
-  });
+  newAgentBtn.addEventListener('click', () => createUserAgent());
 }
 setWorkspaceView(localStorage.getItem(VIEW_STORAGE_KEY) || 'agents', false);
 
@@ -2532,8 +2542,37 @@ searchClear.addEventListener('click', () => {
   renderModuleList($('#filter-input').value);
   searchInput.focus();
 });
-// Cmd/Ctrl+F focuses search
+
+function isNewAgentShortcut(e) {
+  return (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && (e.key || '').toLowerCase() === 't';
+}
+
+function shortcutTargetIsEditable(target) {
+  const el = target instanceof Element ? target : null;
+  if (!el) return false;
+  if (el.closest('.agent-term')) return false;
+  return Boolean(el.closest('input, textarea, select, [contenteditable="true"]'));
+}
+
+function handleNewAgentCommand(e) {
+  const target = e ? e.target : document.activeElement;
+  if (shortcutTargetIsEditable(target)) return;
+  if (e) {
+    e.preventDefault();
+    e.stopPropagation();
+  }
+  createUserAgent();
+}
+
+window.addEventListener('tree:new-agent', () => handleNewAgentCommand());
+
+// Cmd/Ctrl+F focuses search. Cmd/Ctrl+T creates a new agent in browser mode;
+// the Electron menu owns the desktop accelerator and dispatches tree:new-agent.
 document.addEventListener('keydown', (e) => {
+  if (!window.electronNative && isNewAgentShortcut(e)) {
+    handleNewAgentCommand(e);
+    return;
+  }
   if ((e.metaKey || e.ctrlKey) && e.key === 'f') {
     e.preventDefault();
     searchInput.focus();
@@ -2546,7 +2585,7 @@ document.addEventListener('keydown', (e) => {
     renderModuleList($('#filter-input').value);
     searchInput.blur();
   }
-});
+}, true);
 
 // ============================================================
 // Provider preflight — surface which CLIs are available

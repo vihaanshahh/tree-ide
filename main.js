@@ -547,6 +547,14 @@ async function newWindowWithPicker() {
   return createWindow(root);
 }
 
+function dispatchRendererCommand(command) {
+  const r = focusedRecord();
+  if (!r || !r.win || r.win.isDestroyed()) return;
+  const eventName = `tree:${command}`;
+  const script = `window.dispatchEvent(new Event(${JSON.stringify(eventName)}));`;
+  r.win.webContents.executeJavaScript(script).catch(() => {});
+}
+
 if (gotSingleInstanceLock) app.whenReady().then(async () => {
   try { app.setName('Tree'); } catch {}
   if (process.platform === 'darwin' && app.dock) {
@@ -561,6 +569,7 @@ if (gotSingleInstanceLock) app.whenReady().then(async () => {
       label: 'File',
       submenu: [
         { label: 'New Window', accelerator: 'CmdOrCtrl+N', click: () => { createWindow(); } },
+        { label: 'New Agent', accelerator: 'CmdOrCtrl+T', click: () => { dispatchRendererCommand('new-agent'); } },
         { label: 'Open Repo in New Window…', accelerator: 'CmdOrCtrl+Shift+N', click: () => { newWindowWithPicker(); } },
         { type: 'separator' },
         { label: 'Open Repo…', accelerator: 'CmdOrCtrl+O', click: () => {

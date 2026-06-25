@@ -110,6 +110,26 @@ async function main() {
     assert.strictEqual(usageTab.pane, true, 'usage pane should become active');
     assert.strictEqual(usageTab.api, true, 'usage API should be exposed');
 
+    const agentShortcut = await win.webContents.executeJavaScript(`
+      (() => {
+        const before = state.agents.size;
+        const event = new KeyboardEvent('keydown', { key: 't', ctrlKey: true, bubbles: true, cancelable: true });
+        document.dispatchEvent(event);
+        const active = state.agents.get(state.activeAgentId);
+        return {
+          before,
+          after: state.agents.size,
+          view: state.view,
+          activeLabel: active && active.label,
+          defaultPrevented: event.defaultPrevented,
+        };
+      })()
+    `);
+    assert.strictEqual(agentShortcut.after, agentShortcut.before + 1, 'Cmd/Ctrl+T should create a new agent');
+    assert.strictEqual(agentShortcut.view, 'agents', 'new agent shortcut should show the agents view');
+    assert.strictEqual(agentShortcut.defaultPrevented, true, 'new agent shortcut should suppress browser new-tab behavior');
+    assert(/^Agent \d+$/.test(agentShortcut.activeLabel), 'new agent shortcut should focus the new agent');
+
     const workerResult = await win.webContents.executeJavaScript(`
       new Promise((resolve) => {
         const nodes = Array.from({ length: 430 }, (_, i) => ({
