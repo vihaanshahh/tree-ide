@@ -60,7 +60,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-13   # Intel runner → correct x86_64 native modules
+          - runner: macos-15-intel   # Intel (x86_64) runner — macos-13 retired Dec 2025; macos-15-intel is the last Intel image (until ~Aug 2027)
             arch: x64
           - runner: macos-14   # Apple Silicon runner → correct arm64 native modules
             arch: arm64
