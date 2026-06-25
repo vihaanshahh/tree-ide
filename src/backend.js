@@ -382,6 +382,7 @@ class Backend {
       const patch = diffGraphStates(this.currentGraph, next, {
         seq,
         root,
+        files: graph.files || [],
         fileCount: graph.fileCount,
         elapsedMs: graph.elapsedMs,
       });

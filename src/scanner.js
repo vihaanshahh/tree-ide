@@ -20,6 +20,15 @@ const CODE_FILENAMES = new Set([
   'Gemfile.lock', 'composer.lock', 'pubspec.lock', 'gradle.lockfile',
 ]);
 
+const SEARCH_BINARY_EXT = new Set([
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.ico', '.icns', '.bmp', '.tiff', '.heic',
+  '.mp3', '.mp4', '.mov', '.avi', '.mkv', '.webm', '.wav', '.flac', '.ogg',
+  '.zip', '.tar', '.gz', '.tgz', '.bz2', '.xz', '.7z', '.rar',
+  '.pdf', '.dmg', '.pkg', '.exe', '.dll', '.so', '.dylib', '.node',
+  '.woff', '.woff2', '.ttf', '.otf', '.eot',
+]);
+const MAX_SEARCH_FILE_BYTES = 500_000;
+
 const SKIP_DIRS = new Set([
   'node_modules', '.git', 'dist', 'build', '.next', '.nuxt', '.expo',
   '.cache', 'venv', '.venv', 'env', '.env', '__pycache__', 'target', '.idea',
@@ -141,6 +150,23 @@ function loadGitStatus(root) {
     return statusByRel;
   }
 
+  const relFromGitPath = (relToGit) => {
+    const abs = path.join(gitRoot, relToGit);
+    let relToRoot = path.relative(root, abs);
+    if (!relToRoot || relToRoot.startsWith('..') || path.isAbsolute(relToRoot)) return null;
+    return relToRoot.split(path.sep).join('/');
+  };
+  const mergeStatus = (relToRoot, next) => {
+    if (!relToRoot) return;
+    const prev = statusByRel.get(relToRoot) || {};
+    statusByRel.set(relToRoot, {
+      ...prev,
+      ...next,
+      dirty: Boolean(prev.dirty || next.dirty),
+      unpushed: Boolean(prev.unpushed || next.unpushed),
+    });
+  };
+
   let raw = '';
   try {
     raw = execFileSync('git', ['-C', root, 'status', '--porcelain=v1', '-z', '--untracked-files=all'], {
@@ -161,15 +187,12 @@ function loadGitStatus(root) {
     if ((index === 'R' || index === 'C') && i + 1 < parts.length) {
       i++;
     }
-    const abs = path.join(gitRoot, relToGit);
-    let relToRoot = path.relative(root, abs);
-    if (!relToRoot || relToRoot.startsWith('..') || path.isAbsolute(relToRoot)) continue;
-    relToRoot = relToRoot.split(path.sep).join('/');
+    const relToRoot = relFromGitPath(relToGit);
     const staged = index !== ' ' && index !== '?';
     const unstaged = worktree !== ' ';
     const untracked = index === '?' && worktree === '?';
     const deleted = index === 'D' || worktree === 'D';
-    statusByRel.set(relToRoot, {
+    mergeStatus(relToRoot, {
       index,
       worktree,
       code: `${index}${worktree}`,
@@ -179,6 +202,30 @@ function loadGitStatus(root) {
       deleted,
       dirty: true,
     });
+  }
+
+  let upstream = '';
+  try {
+    upstream = execFileSync('git', ['-C', root, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {}
+  if (upstream) {
+    let aheadRaw = '';
+    try {
+      aheadRaw = execFileSync('git', ['-C', root, 'diff', '--name-only', '-z', `${upstream}...HEAD`], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        maxBuffer: 8 * 1024 * 1024,
+      });
+    } catch {}
+    for (const relToGit of aheadRaw.split('\0').filter(Boolean)) {
+      mergeStatus(relFromGitPath(relToGit), {
+        committed: true,
+        unpushed: true,
+      });
+    }
   }
   return statusByRel;
 }
@@ -214,9 +261,7 @@ async function walkRepo(root, opts = {}) {
         if (ig.ignores(rel + '/')) continue;
         await walk(full);
       } else if (e.isFile()) {
-        if (ig.ignores(rel)) continue;
         const ext = path.extname(e.name).toLowerCase();
-        if (!CODE_EXT.has(ext) && !CODE_FILENAMES.has(e.name)) continue;
         let size = 0;
         let mtimeMs = 0;
         try {
@@ -224,8 +269,10 @@ async function walkRepo(root, opts = {}) {
           size = st.size;
           mtimeMs = st.mtimeMs;
         } catch {}
-        if (size > 500_000) continue;
-        files.push({ rel, full, ext, size, mtimeMs });
+        if (!isSearchIndexedFile(e.name, ext, size)) continue;
+        const indexOnly = !isCodeIndexedFile(e.name, ext);
+        if (!indexOnly && ig.ignores(rel)) continue;
+        files.push({ rel, full, ext, size, mtimeMs, indexOnly });
       }
     }
   }
@@ -291,6 +338,42 @@ function frameworkTags(fw) {
   if (fw.docker) tags.push('Docker');
   if (fw.infra) tags.push('Infra');
   return tags;
+}
+
+function isCodeIndexedFile(name, ext) {
+  return CODE_EXT.has(ext) || CODE_FILENAMES.has(name);
+}
+
+function isSearchIndexedFile(name, ext, size) {
+  if (isCodeIndexedFile(name, ext)) return true;
+  if (size > MAX_SEARCH_FILE_BYTES) return false;
+  return !SEARCH_BINARY_EXT.has(ext);
+}
+
+function detectIndexOnlySemantic(rel) {
+  const base = path.basename(rel);
+  const lower = base.toLowerCase();
+  const baseNoExt = base.replace(/\.[^.]+$/, '');
+  if (
+    lower === '.env' ||
+    lower.startsWith('.env.') ||
+    lower.endsWith('.env') ||
+    lower === '.npmrc' ||
+    lower === '.yarnrc' ||
+    lower === '.nvmrc' ||
+    lower === '.node-version' ||
+    lower === '.ruby-version' ||
+    lower === '.python-version' ||
+    lower === '.gitignore' ||
+    lower === '.dockerignore' ||
+    lower === '.editorconfig'
+  ) {
+    return { kind: 'config', label: 'Config', sublabel: base };
+  }
+  if (/^(license|licence|notice|authors|contributors|changelog|changes)$/i.test(baseNoExt)) {
+    return { kind: 'docs', label: 'Docs', sublabel: base };
+  }
+  return { kind: 'other', label: 'File', sublabel: base };
 }
 
 // ===== Semantic detection =====
@@ -1249,6 +1332,7 @@ async function buildGraph(root, opts = {}) {
   const fileIndex = new Map();
   const fileByRel = new Map();
   for (const f of files) {
+    if (f.indexOnly) continue;
     fileIndex.set(f.full, f);
     fileByRel.set(f.rel, f);
   }
@@ -1289,6 +1373,7 @@ async function buildGraph(root, opts = {}) {
   ])];
 
   const fileNodes = [];
+  const fileEntries = [];
   const fileMeta = new Map(); // rel -> { exports, importsDetailed, semantic, apiCalls, isRoute, sublabel }
   const rootCache = cacheForRoot(root);
   const seenRels = new Set(files.map(f => f.rel));
@@ -1304,10 +1389,60 @@ async function buildGraph(root, opts = {}) {
       const cached = cacheKey ? rootCache.get(f.rel) : null;
       if (cached && cached.key === cacheKey) {
         fileMeta.set(f.rel, cloneData(cached.meta));
-        fileNodes.push({
+        const node = {
           ...cloneData(cached.node),
           gitStatus: gitStatusByRel.get(f.rel) || null,
+        };
+        node.indexOnly = Boolean(node.indexOnly || f.indexOnly);
+        node.mapped = !node.indexOnly;
+        fileEntries.push(node);
+        if (!node.indexOnly) fileNodes.push(node);
+        return;
+      }
+
+      if (f.indexOnly) {
+        const semantic = detectIndexOnlySemantic(f.rel);
+        const metaEntry = {
+          exports: [],
+          importsDetailed: [],
+          semantic,
+          apiCalls: null,
+          mountDecls: [],
+          tables: null,
+          endpoints: null,
+          content: null,
+          indexOnly: true,
+        };
+        fileMeta.set(f.rel, metaEntry);
+
+        const baseName = path.basename(f.rel);
+        const nodeBase = {
+          id: f.rel,
+          label: semantic.label,
+          sublabel: semantic.sublabel || '',
+          kind: semantic.kind,
+          methods: null,
+          ext: f.ext,
+          dir: path.dirname(f.rel),
+          size: f.size,
+          type: 'file',
+          filename: baseName,
+          exports: [],
+          importsRefs: [],
+          indexOnly: true,
+          mapped: false,
+        };
+        fileEntries.push({
+          ...nodeBase,
+          gitStatus: gitStatusByRel.get(f.rel) || null,
         });
+        if (cacheKey) {
+          rootCache.set(f.rel, {
+            key: cacheKey,
+            meta: cloneData(metaEntry),
+            node: cloneData(nodeBase),
+          });
+        }
         return;
       }
 
@@ -1375,11 +1510,15 @@ async function buildGraph(root, opts = {}) {
         importsRefs: importsDetailed
           .filter(i => i.local && i.names.length)
           .map(i => ({ source: i.source, names: i.names })),
+        indexOnly: false,
+        mapped: true,
       };
-      fileNodes.push({
+      const node = {
         ...nodeBase,
         gitStatus: gitStatusByRel.get(f.rel) || null,
-      });
+      };
+      fileNodes.push(node);
+      fileEntries.push(node);
       if (cacheKey) {
         rootCache.set(f.rel, {
           key: cacheKey,
@@ -2080,6 +2219,7 @@ async function buildGraph(root, opts = {}) {
 
   return {
     nodes: fileNodes,
+    files: fileEntries,
     edges: finalEdges,
     fnEdges,
     root,

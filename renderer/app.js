@@ -170,6 +170,7 @@ const KIND_TO_LAYER = {
 
 function fileDisplayLabel(f) {
   if (!f) return '';
+  if (f.indexOnly && (f.sublabel || f.filename)) return f.sublabel || f.filename;
   if (f.kind === 'route' && f.sublabel) return `${f.label} ${f.sublabel}`;
   if (f.kind === 'page' && f.sublabel) return pageDisplayLabel(f);
   if ((f.kind === 'layout' || f.kind === 'template') && f.sublabel) return routeFileDisplayLabel(f);
@@ -181,6 +182,20 @@ function fileDisplayLabel(f) {
   }
   if (f.kind === 'middleware') return 'middleware';
   return f.label || f.filename || f.id;
+}
+
+function graphDataFiles(data) {
+  if (Array.isArray(data?.files)) return data.files;
+  return (data?.nodes || []).filter(n => n.type !== 'external');
+}
+
+function fileRecord(id) {
+  return graph.files.get(id) || state.files.find(f => f.id === id) || null;
+}
+
+function fileSearchText(f) {
+  const aliases = f.indexOnly ? ' file search indexed dotfile env local config' : '';
+  return `${fileDisplayLabel(f)} ${f.id} ${f.filename || ''} ${f.kind || ''}${aliases}`.toLowerCase();
 }
 
 function pageDisplayLabel(f) {
@@ -237,9 +252,11 @@ function renderModuleList(filter = '') {
 
   // group files by layer → kind → files
   const grouped = new Map();
-  for (const file of graph.files.values()) {
-    if (file.hidden && !hasFilter) continue;
-    const text = file.searchText || `${fileDisplayLabel(file)} ${file.id} ${file.kind}`.toLowerCase();
+  for (const sourceFile of state.files) {
+    const mappedFile = graph.files.get(sourceFile.id);
+    const file = mappedFile || sourceFile;
+    if (mappedFile?.hidden && !hasFilter) continue;
+    const text = mappedFile?.searchText || file.searchText || fileSearchText(file);
     if (f && !text.includes(f)) continue;
     const layerId = KIND_TO_LAYER[file.kind] || 'support';
     if (!grouped.has(layerId)) grouped.set(layerId, new Map());
@@ -280,7 +297,7 @@ function renderModuleList(filter = '') {
         row.title = file.id;
         row.addEventListener('click', () => {
           selectFile(file.id);
-          graph.panTo(file.id);
+          if (graph.files.has(file.id)) graph.panTo(file.id);
         });
         frag.appendChild(row);
       }
@@ -351,11 +368,16 @@ $('#theme-toggle').addEventListener('click', () => {
 function selectModule() {} // legacy no-op
 
 function selectFile(id) {
-  const f = graph.files.get(id);
+  const f = fileRecord(id);
   if (!f) return;
   state.selected = { kind: 'file', id, label: fileDisplayLabel(f) };
-  graph.selected = state.selected;
-  graph.setFocusCompact?.(id, { fit: true });
+  if (graph.files.has(id)) {
+    graph.selected = state.selected;
+    graph.setFocusCompact?.(id, { fit: true });
+  } else {
+    graph.selected = null;
+    graph.clearFocusCompact?.({ fit: false });
+  }
   renderFileDetail(f);
   switchTab('module');
   renderModuleList($('#filter-input').value);
@@ -1613,7 +1635,7 @@ async function openRepo(forcePath) {
     return;
   }
   state.graphData = result;
-  state.files = result.nodes.filter(n => n.type !== 'external');
+  state.files = graphDataFiles(result);
   state.graphStale = false;
   addRecentRepo(p);
   graph.load(result);
@@ -1625,7 +1647,7 @@ async function openRepo(forcePath) {
   const stampEl = $('#stamp-sub');
   if (stampEl) stampEl.textContent = shorten(p);
   const mappedNodes = [...graph.files.values()].filter(f => f.kind !== 'external');
-  const pendingCount = mappedNodes.filter(fileHasOpenGitChange).length;
+  const pendingCount = state.files.filter(fileHasOpenGitChange).length;
   const sqlWriteCount = mappedNodes.filter(f => f.kind === 'table' && f.sqlStats && f.sqlStats.write).length;
   const stackText = result.stackSummary && result.stackSummary.length ? ` · ${result.stackSummary.slice(0, 5).join('/')}` : '';
   $('#hud-status').textContent = `${result.fileCount} files · ${mappedNodes.length} nodes · ${graph.layers.length} layers · ${pendingCount} pending · ${sqlWriteCount} SQL writes${stackText}`;
@@ -2325,7 +2347,7 @@ function scheduleRescan(delay = 600) {
     if (seq !== rescanSeq) return;
     if (result && !result.error) {
       state.graphData = result;
-      state.files = result.nodes.filter(n => n.type !== 'external');
+      state.files = graphDataFiles(result);
       graph.load(result);
       refreshFileChrome();
       state.graphStale = false;
@@ -2337,12 +2359,59 @@ function stubHintForPath(rel) {
   const name = rel.split('/').pop() || rel;
   const ext = name.includes('.') ? '.' + name.split('.').pop().toLowerCase() : '';
   let kind = 'module';
-  if (/\.(css|scss|sass|less)$/i.test(name)) kind = 'styles';
+  if (/^\.env(?:\.|$)/i.test(name) || /^\.?(npmrc|yarnrc|nvmrc|node-version|ruby-version|python-version|gitignore|dockerignore|editorconfig)$/i.test(name)) kind = 'config';
+  else if (/\.(css|scss|sass|less)$/i.test(name)) kind = 'styles';
   else if (/\.(test|spec)\.(t|j)sx?$/i.test(name) || /^test_.+\.py$/i.test(name)) kind = 'test';
   else if (/\.sql$/i.test(name) || /schema\.(ts|js|prisma|sql)$/i.test(name)) kind = 'schema';
   else if (/^(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|Cargo\.lock|poetry\.lock)$/i.test(name)) kind = 'config';
   else if (/dockerfile|docker-compose\.ya?ml|compose\.ya?ml/i.test(name) || /\.tf$/i.test(name)) kind = 'infra';
   return { label: name, kind, ext };
+}
+
+function shouldMapFilePath(rel) {
+  const name = rel.split('/').pop() || rel;
+  const lower = name.toLowerCase();
+  const ext = name.includes('.') ? '.' + name.split('.').pop().toLowerCase() : '';
+  const codeExt = new Set([
+    '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.py', '.go', '.rs', '.java', '.kt', '.swift',
+    '.rb', '.php', '.c', '.h', '.cpp', '.hpp', '.cs', '.sh', '.lua', '.dart', '.scala',
+    '.vue', '.svelte', '.json', '.yaml', '.yml', '.toml', '.md', '.html', '.css', '.scss',
+    '.sql', '.prisma', '.tf', '.gradle',
+  ]);
+  const codeNames = new Set([
+    'dockerfile', 'containerfile', 'makefile', 'podfile', 'gemfile',
+    'docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml',
+    'settings.gradle', 'build.gradle', 'package-lock.json', 'npm-shrinkwrap.json',
+    'yarn.lock', 'pnpm-lock.yaml', 'bun.lock', 'bun.lockb', 'cargo.lock', 'pipfile.lock',
+    'poetry.lock', 'gemfile.lock', 'composer.lock', 'pubspec.lock', 'gradle.lockfile',
+  ]);
+  return codeExt.has(ext) || codeNames.has(lower);
+}
+
+function upsertSidebarFile(rel) {
+  if (!rel) return;
+  const mapped = graph.files.get(rel);
+  const hint = stubHintForPath(rel);
+  const filename = rel.split('/').pop() || rel;
+  const shouldMap = shouldMapFilePath(rel);
+  const next = mapped || {
+    id: rel,
+    filename,
+    label: hint.label || filename,
+    sublabel: hint.kind === 'config' || hint.kind === 'docs' ? filename : '',
+    kind: shouldMap ? (hint.kind || 'module') : (hint.kind === 'module' ? 'other' : hint.kind),
+    type: 'file',
+    ext: hint.ext,
+    dir: rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '',
+    size: 0,
+    exports: [],
+    importsRefs: [],
+    indexOnly: !shouldMap,
+    mapped: shouldMap,
+  };
+  const existing = state.files.findIndex(f => f.id === rel);
+  if (existing === -1) state.files = [...state.files, next];
+  else state.files = state.files.map((f, i) => i === existing ? { ...f, ...next } : f);
 }
 
 function applyGraphPatchToData(graphData, patch) {
@@ -2362,6 +2431,7 @@ function applyGraphPatchToData(graphData, patch) {
     ...graphData,
     nodes: [...nodesById.values()],
     edges: [...edgesById.values()],
+    files: Array.isArray(patch.files) ? patch.files : graphData.files,
     fileCount: typeof patch.fileCount === 'number' ? patch.fileCount : graphData.fileCount,
     elapsedMs: typeof patch.elapsedMs === 'number' ? patch.elapsedMs : graphData.elapsedMs,
   };
@@ -2377,11 +2447,18 @@ window.tree.onFsEvent((evt) => {
 
   if (evt.type === 'unlink') {
     graph.removeFile(rel);
-  } else if (evt.type === 'add' && !graph.files.get(rel)) {
+    state.files = state.files.filter(f => f.id !== rel);
+  } else if (evt.type === 'add' && !graph.files.get(rel) && shouldMapFilePath(rel)) {
     graph.addFileStub(rel, stubHintForPath(rel));
     graph.touch(rel, 'edit', agentMeta);
+    upsertSidebarFile(rel);
+  } else if (evt.type === 'add' && !graph.files.get(rel)) {
+    upsertSidebarFile(rel);
   } else if (graph.files.get(rel)) {
     graph.touch(rel, 'edit', agentMeta);
+    upsertSidebarFile(rel);
+  } else {
+    upsertSidebarFile(rel);
   }
 
   scheduleFileChromeRefresh(90);
@@ -2404,14 +2481,17 @@ window.tree.onGraphPatch((patch) => {
   if (patch.empty) {
     state.graphData = {
       ...state.graphData,
+      files: Array.isArray(patch.files) ? patch.files : state.graphData.files,
       fileCount: typeof patch.fileCount === 'number' ? patch.fileCount : state.graphData.fileCount,
       elapsedMs: typeof patch.elapsedMs === 'number' ? patch.elapsedMs : state.graphData.elapsedMs,
     };
+    state.files = graphDataFiles(state.graphData);
+    refreshFileChrome();
     state.graphStale = false;
     return;
   }
   state.graphData = applyGraphPatchToData(state.graphData, patch);
-  state.files = state.graphData.nodes.filter(n => n.type !== 'external');
+  state.files = graphDataFiles(state.graphData);
   graph.load(state.graphData);
   refreshFileChrome();
   state.graphStale = false;
@@ -2496,7 +2576,7 @@ function renderKindFilter() {
     frag.appendChild(pill);
   }
   const signals = [
-    { key: 'git', label: 'Pending', count: [...graph.files.values()].filter(fileHasOpenGitChange).length },
+    { key: 'git', label: 'Pending', count: state.files.filter(fileHasOpenGitChange).length },
     { key: 'write', label: 'SQL writes', count: [...graph.files.values()].filter(f => f.kind === 'table' && f.sqlStats && f.sqlStats.write).length },
   ].filter(s => s.count);
   for (const s of signals) {

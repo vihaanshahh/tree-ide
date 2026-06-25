@@ -150,7 +150,9 @@ function edgeTypeWeight(e) {
 
 function baseFeatureScore(f, { matchSet, activeFileIds } = {}) {
   let score = 0;
-  if (f.gitStatus && f.gitStatus.dirty) score += f.gitStatus.untracked ? 12 : 16;
+  if (f.gitStatus && (f.gitStatus.dirty || f.gitStatus.unpushed)) {
+    score += f.gitStatus.untracked ? 12 : f.gitStatus.unpushed ? 10 : 16;
+  }
   if (activeFileIds && activeFileIds.has(f.id)) score += 18;
   if (matchSet && matchSet.has(f.id)) score += 14;
   return score;

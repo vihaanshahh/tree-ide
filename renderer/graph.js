@@ -192,8 +192,16 @@ function bgAlpha(alpha) {
     : `rgba(0, 0, 0, ${alpha})`;
 }
 
+function hasOpenGitChange(f) {
+  const s = f && f.gitStatus;
+  return !!(s && (s.dirty || s.unpushed));
+}
+
 const FONT_MONO = '"NB Akademie Mono", "Space Mono", ui-monospace, SFMono-Regular, Menlo, monospace';
 const FONT_DISPLAY = '"NB Akademie", "Montserrat", ui-sans-serif, system-ui, sans-serif';
+const AGENT_EDIT_COLOR_MS = 2200;
+const AGENT_EDIT_HISTORY_MS = 10000;
+const AGENT_READ_MARK_MS = 2200;
 
 // ============================================================
 // Module-based layout helpers.
@@ -402,7 +410,7 @@ function edgeTypeWeight(e) {
 
 function baseFeatureScore(f, { matchSet, activeFileIds } = {}) {
   let score = 0;
-  if (f.gitStatus && f.gitStatus.dirty) score += f.gitStatus.untracked ? 12 : 16;
+  if (hasOpenGitChange(f)) score += f.gitStatus.untracked ? 12 : f.gitStatus.unpushed ? 10 : 16;
   if (activeFileIds && activeFileIds.has(f.id)) score += 18;
   if (matchSet && matchSet.has(f.id)) score += 14;
   return score;
@@ -607,6 +615,7 @@ class Graph {
     this.replaced = { removed: new Set(), added: new Set(), title: '' };
     this.agentActivity = new Map(); // file id -> agent id -> { label, color, kind, last, count }
     this.featureRelayoutTimer = null;
+    this.agentActivityTimer = null;
     this.focusCompactId = null;
 
     this.camera = { x: 0, y: 0, zoom: 1 };
@@ -671,6 +680,7 @@ class Graph {
       columns: f.columns,
       exports: f.exports,
       gitStatus: f.gitStatus,
+      indexOnly: !!f.indexOnly,
       fullPath: f.fullPath,
       verb: f.verb,
     };
@@ -1217,7 +1227,7 @@ class Graph {
 
   fileSignalWeight(f) {
     let score = this.kindBaseWeight(f.kind);
-    if (f.gitStatus && f.gitStatus.dirty) score += f.gitStatus.untracked ? 3 : 4;
+    if (hasOpenGitChange(f)) score += f.gitStatus.untracked ? 3 : f.gitStatus.unpushed ? 2 : 4;
     if (f.deadApiCalls && f.deadApiCalls.length) score += 5 + f.deadApiCalls.length * 2;
     if (f.exports && f.exports.length) score += Math.min(5, f.exports.length * 0.5);
     if (f.kind === 'table' && f.columns) score += Math.min(6, f.columns.length * 0.35);
@@ -1252,7 +1262,7 @@ class Graph {
     }
     const fnRefs = this.functionEdgesForFile ? this.functionEdgesForFile(f.id).length : 0;
     if (fnRefs) parts.push(`refs ${fnRefs}`);
-    if (f.gitStatus && f.gitStatus.dirty) parts.push('dirty');
+    if (hasOpenGitChange(f)) parts.push(f.gitStatus.unpushed && !f.gitStatus.dirty ? 'unpushed' : 'dirty');
     if (f.deadApiCalls && f.deadApiCalls.length) parts.push(`unmapped ${f.deadApiCalls.length}`);
     return parts.filter(Boolean).join(' · ');
   }
@@ -1294,6 +1304,7 @@ class Graph {
         gitStatus: n.gitStatus || null,
         usage: n.usage || null,
         sqlStats: n.sqlStats || null,
+        indexOnly: !!n.indexOnly,
         ext: n.ext,
         size: n.size || 0,
         dir: n.dir || (n.id.includes('/') ? n.id.slice(0, n.id.lastIndexOf('/')) : ''),
@@ -1306,6 +1317,8 @@ class Graph {
     for (const id of [...this.agentActivity.keys()]) {
       if (!this.files.has(id)) this.agentActivity.delete(id);
     }
+    this.pruneAgentActivity(performance.now());
+    this.scheduleAgentActivityTimer();
     this.fileEdges = (graphData.edges || []).slice();
     for (const e of this.fileEdges) {
       e.isApiCall = e.type === 'api-call';
@@ -1847,7 +1860,7 @@ class Graph {
       context: [],
     };
     const bucketFor = (f) => {
-      if (f.gitStatus && f.gitStatus.dirty) return 'risk';
+      if (hasOpenGitChange(f)) return 'risk';
       if (f.deadApiCalls && f.deadApiCalls.length) return 'risk';
       if (['page', 'layout', 'template', 'app', 'document'].includes(f.kind)) return 'entry';
       if (['component', 'styles', 'loading', 'error', 'notfound', 'special'].includes(f.kind)) return 'components';
@@ -2248,6 +2261,7 @@ class Graph {
       columns: null,
       parentFile: null,
       deadApiCalls: null,
+      indexOnly: false,
       ext: hint.ext || ('.' + (baseName.split('.').pop() || '')),
       size: 0,
       dir: id.includes('/') ? id.slice(0, id.lastIndexOf('/')) : '',
@@ -2277,7 +2291,10 @@ class Graph {
                 : f.kind === 'endpoint'
           ? ' api endpoint route server http get post put patch delete'
           : '';
-    if (f.gitStatus && f.gitStatus.dirty) aliases += ' git dirty changed uncommitted modified';
+    if (hasOpenGitChange(f)) aliases += f.gitStatus.unpushed && !f.gitStatus.dirty
+      ? ' git unpushed committed changed'
+      : ' git dirty changed uncommitted modified';
+    if (f.indexOnly) aliases += ' file search indexed dotfile env local config';
     if (f.kind === 'table' && f.sqlStats) {
       if (f.sqlStats.read) aliases += ' reads read';
       if (f.sqlStats.write) aliases += ' writes write mutation changed';
@@ -2678,17 +2695,21 @@ class Graph {
         this.agentActivity.set(targetId, byAgent);
       }
       const prev = byAgent.get(agent.agentId);
+      const isEdit = kind === 'edit';
       byAgent.set(agent.agentId, {
         id: agent.agentId,
         label: agent.label || agent.agentId,
         color: agent.color || `rgba(${SAND}, 0.95)`,
         kind,
         last: now,
+        colorUntil: now + (isEdit ? AGENT_EDIT_COLOR_MS : AGENT_READ_MARK_MS),
+        expiresAt: now + (isEdit ? AGENT_EDIT_HISTORY_MS : AGENT_READ_MARK_MS),
         count: (prev && prev.count ? prev.count : 0) + 1,
       });
       const ordered = [...byAgent.entries()].sort((a, b) => b[1].last - a[1].last);
       for (const [oldId] of ordered.slice(6)) byAgent.delete(oldId);
       this.scheduleFeatureRelayout();
+      this.scheduleAgentActivityTimer();
     }
     this.invalidate();
   }
@@ -2699,6 +2720,48 @@ class Graph {
       this.featureRelayoutTimer = null;
       this.relayout();
     }, 800);
+  }
+
+  pruneAgentActivity(now = performance.now()) {
+    let changed = false;
+    for (const [fileId, byAgent] of [...this.agentActivity.entries()]) {
+      for (const [agentId, mark] of [...byAgent.entries()]) {
+        if ((mark.expiresAt || 0) <= now) {
+          byAgent.delete(agentId);
+          changed = true;
+        }
+      }
+      if (!byAgent.size || !this.files.has(fileId)) {
+        this.agentActivity.delete(fileId);
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  scheduleAgentActivityTimer() {
+    if (this.agentActivityTimer) {
+      clearTimeout(this.agentActivityTimer);
+      this.agentActivityTimer = null;
+    }
+    const now = performance.now();
+    let next = Infinity;
+    for (const byAgent of this.agentActivity.values()) {
+      for (const mark of byAgent.values()) {
+        if (mark.colorUntil && mark.colorUntil > now) next = Math.min(next, mark.colorUntil);
+        if (mark.expiresAt && mark.expiresAt > now) next = Math.min(next, mark.expiresAt);
+        if (mark.expiresAt && mark.expiresAt <= now) next = Math.min(next, now);
+      }
+    }
+    if (!Number.isFinite(next)) return;
+    const delay = Math.max(16, Math.min(next - now + 24, 60000));
+    this.agentActivityTimer = setTimeout(() => {
+      this.agentActivityTimer = null;
+      const changed = this.pruneAgentActivity(performance.now());
+      if (changed) this.scheduleFeatureRelayout();
+      this.invalidate();
+      this.scheduleAgentActivityTimer();
+    }, delay);
   }
 
   setReplacement(removed, added, title = '') {
@@ -2774,6 +2837,11 @@ class Graph {
         this.activeGlowIds.delete(id);
         this.needsDraw = true;
       }
+    }
+    if (this.pruneAgentActivity(now)) {
+      this.needsDraw = true;
+      this.scheduleFeatureRelayout();
+      this.scheduleAgentActivityTimer();
     }
     // Smooth camera toward target when easing is on (e.g. after fit/panTo)
     if (this.cameraEase > 0) {
@@ -3029,7 +3097,7 @@ class Graph {
       // Tables render as ER cards
       if (f.kind === 'table') {
         const tableDimmed = (isSearching && !isMatch) || (activeId && !inHood && !isSearching);
-        this.drawTableCard(ctx, f, { isSel, isHover, dimmed: tableDimmed, isMatch, z, vb, fast: fastMode });
+        this.drawTableCard(ctx, f, { isSel, isHover, dimmed: tableDimmed, isMatch, z, vb, fast: fastMode, now });
         continue;
       }
 
@@ -3072,7 +3140,7 @@ class Graph {
       ctx.strokeStyle = useTint ? tintRGB(f.kind, borderAlpha) : `rgba(${SAND}, ${borderAlpha})`;
       ctx.lineWidth = (isSel || isHover || isMatch ? 1.4 : 1) / z;
       ctx.strokeRect(f.x, f.y, f.w, f.h);
-      this.drawAgentActivity(ctx, f, { z, dimmed, selectedLike: isSel || isHover || isMatch || inHood });
+      this.drawAgentActivity(ctx, f, { z, dimmed, selectedLike: isSel || isHover || isMatch || inHood, now });
 
       // Removed: diagonal line through
       if (isRemoved) {
@@ -3322,9 +3390,10 @@ class Graph {
 
   gitBadgeLabel(f) {
     const s = f && f.gitStatus;
-    if (!s || !s.dirty) return '';
+    if (!s || (!s.dirty && !s.unpushed)) return '';
     if (s.untracked) return 'G ?';
     if (s.deleted) return 'G D';
+    if (s.unpushed && !s.dirty) return 'G ↑';
     const code = String(s.code || '').replace(/\s/g, '');
     return `G ${code || 'M'}`;
   }
@@ -3354,20 +3423,31 @@ class Graph {
     return parts.join(' · ');
   }
 
-  agentMarksFor(f) {
+  agentMarksFor(f, now = performance.now()) {
     const byAgent = f && this.agentActivity.get(f.id);
     if (!byAgent) return [];
-    return [...byAgent.values()].sort((a, b) => b.last - a.last).slice(0, 6);
+    return [...byAgent.values()]
+      .filter(mark => !mark.expiresAt || mark.expiresAt > now)
+      .sort((a, b) => b.last - a.last)
+      .slice(0, 6);
   }
 
-  drawAgentActivity(ctx, f, { z, dimmed = false, selectedLike = false } = {}) {
-    const marks = this.agentMarksFor(f);
-    if (!marks.length) return;
+  drawAgentActivity(ctx, f, { z, dimmed = false, selectedLike = false, now = performance.now() } = {}) {
+    const marks = this.agentMarksFor(f, now);
+    const hasGitMarker = hasOpenGitChange(f);
+    if (!marks.length && !hasGitMarker) return;
+    const freshMarks = [];
+    const editedMarks = [];
+    for (const mark of marks) {
+      if (mark.kind === 'edit' && mark.colorUntil && mark.colorUntil <= now) editedMarks.push(mark);
+      else freshMarks.push(mark);
+    }
+    const showEditedFileMarker = editedMarks.length || hasGitMarker;
     ctx.save();
     ctx.globalAlpha = dimmed ? 0.58 : 1;
     ctx.lineJoin = 'miter';
-    for (let i = 0; i < marks.length; i++) {
-      const mark = marks[i];
+    for (let i = 0; i < freshMarks.length; i++) {
+      const mark = freshMarks[i];
       const offset = (2 + i * 2) / z;
       ctx.strokeStyle = mark.color || `rgba(${SAND}, 0.95)`;
       ctx.lineWidth = (mark.kind === 'edit' ? 1.8 : 1.05) / z;
@@ -3380,11 +3460,36 @@ class Graph {
     const tickW = 7 / z;
     const tickH = 3 / z;
     let x = f.x + 6 / z;
-    for (const mark of marks.slice(0, 6)) {
+    for (const mark of freshMarks.slice(0, 6)) {
       ctx.fillStyle = mark.color || `rgba(${SAND}, 0.95)`;
       ctx.fillRect(x, f.y + 2 / z, tickW, tickH);
       x += tickW + 3 / z;
       if (x > f.x + f.w - 8 / z) break;
+    }
+    if (showEditedFileMarker) {
+      const marker = Math.min(10 / z, Math.max(5, f.h * 0.5), Math.max(5, f.w * 0.16));
+      const alpha = dimmed ? 0.32 : 0.68;
+      ctx.fillStyle = `rgba(${SAND}, ${alpha})`;
+      ctx.beginPath();
+      ctx.moveTo(f.x + f.w, f.y);
+      ctx.lineTo(f.x + f.w - marker, f.y);
+      ctx.lineTo(f.x + f.w, f.y + marker);
+      ctx.closePath();
+      ctx.fill();
+
+      const chips = editedMarks.slice(0, 3);
+      const chipW = Math.min(7 / z, marker * 0.65);
+      const chipH = Math.min(2.5 / z, Math.max(1.5, marker * 0.18));
+      const chipGap = Math.min(3 / z, marker * 0.3);
+      let chipX = f.x + f.w - marker - chipGap - chips.length * chipW - (chips.length - 1) * chipGap;
+      const chipY = f.y + Math.min(4 / z, Math.max(2, marker * 0.22));
+      for (const mark of chips) {
+        ctx.fillStyle = mark.color || `rgba(${SAND}, 0.72)`;
+        ctx.globalAlpha = dimmed ? 0.32 : 0.5;
+        ctx.fillRect(chipX, chipY, chipW, chipH);
+        chipX += chipW + chipGap;
+      }
+      ctx.globalAlpha = dimmed ? 0.58 : 1;
     }
     ctx.restore();
   }
@@ -3460,7 +3565,7 @@ class Graph {
   // ER-style table card: header bar (subtle), column rows below.
   // Visually consistent with other cthdrl cards — black bg, 1px sand stroke,
   // monospace text. Header is set apart by a horizontal rule, not a fill.
-  drawTableCard(ctx, f, { isSel, isHover, dimmed, isMatch, z, vb, fast = false }) {
+  drawTableCard(ctx, f, { isSel, isHover, dimmed, isMatch, z, vb, fast = false, now = performance.now() }) {
     const headerH = 26, rowH = 17;
     const baseAlpha = dimmed ? 0.58 : 1;
     const overview = z < this.TABLE_DETAIL_ZOOM && !isSel && !isHover && !isMatch;
@@ -3486,7 +3591,7 @@ class Graph {
       ctx.strokeStyle = tintRGB('table', isSel || isHover || isMatch ? 0.95 : (dimmed ? 0.16 : 0.42));
       ctx.lineWidth = (isSel || isHover ? 1.4 : 1) / z;
       ctx.strokeRect(f.x, f.y, f.w, f.h);
-      this.drawAgentActivity(ctx, f, { z, dimmed, selectedLike: isSel || isHover || isMatch });
+      this.drawAgentActivity(ctx, f, { z, dimmed, selectedLike: isSel || isHover || isMatch, now });
       ctx.globalAlpha = 1;
       return;
     }
@@ -3590,7 +3695,7 @@ class Graph {
     ctx.strokeRect(f.x, f.y, f.w, f.h);
 
     ctx.globalAlpha = 1;
-    this.drawAgentActivity(ctx, f, { z, dimmed, selectedLike: isSel || isHover || isMatch });
+    this.drawAgentActivity(ctx, f, { z, dimmed, selectedLike: isSel || isHover || isMatch, now });
     this.drawMapBadges(ctx, f, { z, dimmed, selectedLike: isSel || isHover || isMatch });
   }
 
