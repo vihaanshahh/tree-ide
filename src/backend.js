@@ -80,6 +80,10 @@ function searchPathFor(bin) {
     `${home}/.npm-global/bin/${bin}`,
     `${home}/.claude/local/${bin}`,
     `${home}/.claude/bin/${bin}`,
+    `${home}/.cursor/bin/${bin}`,
+    `${home}/.antigravity/bin/${bin}`,
+    `/Applications/Cursor.app/Contents/Resources/app/bin/${bin}`,
+    `/Applications/Antigravity.app/Contents/Resources/app/bin/${bin}`,
     `/opt/homebrew/bin/${bin}`,
     `/usr/local/bin/${bin}`,
     `/usr/bin/${bin}`,
@@ -97,6 +101,33 @@ function searchPathFor(bin) {
 
 function shellQuote(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+const AGENT_PROVIDERS = {
+  claude: {
+    bin: 'claude',
+    mode: 'direct',
+    missing: 'claude CLI not found. Install: npm i -g @anthropic-ai/claude-code',
+  },
+  codex: {
+    bin: 'codex',
+    mode: 'shell-command',
+    missing: 'codex CLI not found. Install: npm i -g @openai/codex',
+  },
+  'cursor-agent': {
+    bin: 'cursor-agent',
+    mode: 'shell-command',
+    missing: 'cursor-agent CLI not found.',
+  },
+  antigravity: {
+    bin: 'agy',
+    mode: 'shell-command',
+    missing: 'Antigravity agy CLI not found.',
+  },
+};
+
+function agentProviderCommand(provider) {
+  return AGENT_PROVIDERS[provider]?.bin || null;
 }
 
 function stableJson(value) {
@@ -249,11 +280,11 @@ class Backend {
   }
 
   detectProviders() {
-    return {
-      claude: searchPathFor('claude'),
-      codex:  searchPathFor('codex'),
-      shell:  process.env.SHELL || '/bin/zsh',
-    };
+    const found = { shell: process.env.SHELL || '/bin/zsh' };
+    for (const [provider, meta] of Object.entries(AGENT_PROVIDERS)) {
+      found[provider] = searchPathFor(meta.bin);
+    }
+    return found;
   }
 
   getStartupRoot() {
@@ -409,15 +440,20 @@ class Backend {
     if (pty._error) return { error: `node-pty unavailable: ${pty._error.message}` };
 
     const providers = this.detectProviders();
-    let program, args;
-    if (provider === 'claude') {
-      program = cliOverride || providers.claude;
-      if (!program) return { error: 'claude CLI not found. Install: npm i -g @anthropic-ai/claude-code' };
-      args = [];
-    } else if (provider === 'codex') {
-      program = cliOverride || providers.codex;
-      if (!program) return { error: 'codex CLI not found. Install: npm i -g @openai/codex' };
-      args = [];
+    let program, args, runInShell = null, shellCommandDir = null;
+    const providerMeta = AGENT_PROVIDERS[provider];
+    if (providerMeta) {
+      const resolved = cliOverride || providers[provider];
+      if (!resolved) return { error: providerMeta.missing };
+      if (providerMeta.mode === 'shell-command') {
+        program = process.env.SHELL || '/bin/zsh';
+        args = ['-l'];
+        runInShell = providerMeta.bin;
+        shellCommandDir = path.dirname(resolved);
+      } else {
+        program = resolved;
+        args = [];
+      }
     } else {
       program = process.env.SHELL || '/bin/zsh';
       args = ['-l'];
@@ -431,9 +467,14 @@ class Backend {
       delete env.ANTHROPIC_AUTH_TOKEN;
     }
     env.PATH = [
+      shellCommandDir,
       `${process.env.HOME}/.local/bin`,
       `${process.env.HOME}/.npm-global/bin`,
       `${process.env.HOME}/.claude/local`,
+      `${process.env.HOME}/.cursor/bin`,
+      `${process.env.HOME}/.antigravity/bin`,
+      '/Applications/Cursor.app/Contents/Resources/app/bin',
+      '/Applications/Antigravity.app/Contents/Resources/app/bin',
       '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin',
       env.PATH || '',
     ].filter(Boolean).join(':');
@@ -451,17 +492,41 @@ class Backend {
       return { error: `Failed to spawn ${provider}: ${e.message}` };
     }
 
-    const record = { term, provider, cwd, program, startedAt: Date.now(), lastOutputAt: 0 };
+    const record = { term, provider, cwd, program, startedAt: Date.now(), lastOutputAt: 0, pendingOut: '', flushTimer: null };
     this.ptyAgents.set(agentId, record);
-    term.onData((data) => {
-      if (data) record.lastOutputAt = Date.now();
+    const isCurrentRecord = () => this.ptyAgents.get(agentId) === record;
+    // Chatty CLIs (token-by-token model output) can call onData dozens of
+    // times a second. Coalescing into one emit per ~8ms window cuts the
+    // JSON.stringify + WS-send + JSON.parse cycle to a fraction of the
+    // message count without adding perceptible latency (well under a
+    // frame), on top of the renderer's own per-frame write batching.
+    const flushPty = () => {
+      record.flushTimer = null;
+      if (!record.pendingOut) return;
+      const data = record.pendingOut;
+      record.pendingOut = '';
+      if (!isCurrentRecord()) return;
       this.events.emit('pty:data', { agentId, data });
+    };
+    term.onData((data) => {
+      if (!data) return;
+      if (!isCurrentRecord()) return;
+      record.lastOutputAt = Date.now();
+      record.pendingOut += data;
+      if (!record.flushTimer) record.flushTimer = setTimeout(flushPty, 8);
     });
     term.onExit(({ exitCode, signal }) => {
+      if (record.flushTimer) { clearTimeout(record.flushTimer); flushPty(); }
+      if (!isCurrentRecord()) return;
       this.ptyAgents.delete(agentId);
       this.events.emit('pty:exit', { agentId, exitCode, signal });
       this.scheduleUsageUpdate(false);
     });
+    if (runInShell) {
+      setTimeout(() => {
+        try { term.write(`${runInShell}\r`); } catch {}
+      }, 120);
+    }
     this.scheduleUsageUpdate(false);
     return { ok: true, provider, program, cwd, pid: term.pid };
   }
@@ -496,13 +561,12 @@ class Backend {
     const { provider = 'shell', cwd: cwdOpt } = payload || {};
     const cwd = cwdOpt || this.currentRoot || process.env.HOME || process.cwd();
     const providers = this.detectProviders();
-    if (provider === 'claude' && !providers.claude)
-      return { error: 'claude CLI not found. Install: npm i -g @anthropic-ai/claude-code' };
-    if (provider === 'codex' && !providers.codex)
-      return { error: 'codex CLI not found. Install: npm i -g @openai/codex' };
+    const providerMeta = AGENT_PROVIDERS[provider];
+    if (providerMeta && !providers[provider]) return { error: providerMeta.missing };
+    const command = agentProviderCommand(provider);
     const cmds = provider === 'shell'
       ? [`cd ${shellQuote(cwd)}`]
-      : [`cd ${shellQuote(cwd)}`, provider];
+      : [`cd ${shellQuote(cwd)}`, command || provider];
     const cmd = cmds.join(' && ');
 
     if (process.env.TREE_IDE_HEADLESS === '1') {

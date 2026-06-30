@@ -21,6 +21,7 @@ const { spawn } = require('child_process');
 const net = require('net');
 const { Backend, normalizeOpenRoot, compareVersions, fetchLatestRelease } = require('./src/backend');
 const { startServer } = require('./src/server');
+const { UsageService } = require('./src/usage/service');
 const pkg = require('./package.json');
 
 // electron-updater is optional — required lazily so unsigned/dev builds and
@@ -143,6 +144,13 @@ function getAppIcon() {
 //   { win, backend, server, localServerUrl, sshChild }
 // Module-level singletons are gone — everything is looked up per window.
 const windows = new Set();
+
+// Usage (TokenMax) is the one exception: it reflects account-wide Claude/Codex
+// quota, not anything repo-specific, so every window's Backend shares this one
+// UsageService instance. Without it, N open windows each ran their own ~15s
+// cache + cold-start scan of the Claude/Codex usage data on disk — same data,
+// N times the CPU and disk I/O.
+const sharedUsageService = new UsageService();
 
 function recordForWebContents(wc) {
   const win = wc ? BrowserWindow.fromWebContents(wc) : null;
@@ -475,6 +483,7 @@ async function createWindow(openRoot = null) {
       pkg,
       updateRepo: UPDATE_REPO,
       electronHooks: buildElectronHooks(() => record),
+      usageService: sharedUsageService,
     });
     record.server = await startServer({ backend: record.backend, host: '127.0.0.1', port: 0 });
   } catch (e) {

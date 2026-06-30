@@ -2,6 +2,29 @@
 
 All notable changes to Tree IDE.
 
+## [0.4.6] - 2026-06-30
+
+### Added
+
+- New `cursor-agent` and Antigravity (`agy`) CLI providers for agent tiles,
+  alongside Claude, Codex, and plain shell.
+
+### Changed
+
+- Usage (TokenMax) indexing is now shared across every open window instead of
+  each window re-scanning independently — opening more windows no longer
+  multiplies the CPU/disk cost of keeping the Usage panel fresh.
+- Agent terminal output is batched (both server- and renderer-side) and the
+  cursor only blinks on the focused tile, cutting idle CPU/redraw cost when
+  running many agents across multiple windows at once.
+- Tighter, more responsive agent grid layout.
+
+### Fixed
+
+- Terminal input could render clipped off the bottom of an agent tile (an
+  xterm FitAddon/CSS padding mismatch) — typed text and the cursor are now
+  always fully visible.
+
 ## [0.4.5] - 2026-06-25
 
 ### Added

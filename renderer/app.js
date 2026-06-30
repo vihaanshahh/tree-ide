@@ -73,6 +73,9 @@ const AGENT_COLORS = [
   'hsl(98, 58%, 50%)',
   'hsl(268, 68%, 64%)',
 ];
+const AGENT_SESSION_ID = (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`)
+  .replace(/[^a-zA-Z0-9_-]/g, '')
+  .slice(0, 18);
 const EXTERNAL_WRITE_META = { agentId: '__external__', label: 'External', color: 'hsl(8, 72%, 62%)' };
 const AGENT_WRITE_WINDOW_MS = 15000;
 
@@ -1380,9 +1383,9 @@ function setWorkspaceView(view, persist = true) {
   if (persist) localStorage.setItem(VIEW_STORAGE_KEY, next);
 
   if (next === 'agents') {
+    ensurePrimaryAgent();
     graph.setPaused(true);
     switchTab('chat');
-    refitAgents({ focus: true });
     return;
   }
 
@@ -1609,7 +1612,7 @@ async function loadFileViewer(rel, opts = {}) {
 async function syncFreshAgentsToRepo() {
   if (!state.root || !state.agents) return;
   for (const agent of state.agents.values()) {
-    if (agent.provider !== 'shell' || agent.hasInput) continue;
+    if (agent.hasInput) continue;
     await respawnAgent(agent);
   }
 }
@@ -1625,9 +1628,6 @@ async function openRepo(forcePath) {
   $('#repo-name').textContent = shorten(p);
   $('#hud-status').textContent = 'Scanning…';
   $('#welcome').classList.add('hidden');
-  if (window.tree.watchFs) {
-    try { await window.tree.watchFs(p); } catch {}
-  }
 
   const result = await window.tree.scanRepo(p);
   if (result.error) {
@@ -1643,7 +1643,6 @@ async function openRepo(forcePath) {
   renderModuleList();
   renderFileDetail(null);
   syncFreshAgentsToRepo().catch(() => {});
-  refreshUsage().catch(() => {});
   const stampEl = $('#stamp-sub');
   if (stampEl) stampEl.textContent = shorten(p);
   const mappedNodes = [...graph.files.values()].filter(f => f.kind !== 'external');
@@ -1915,13 +1914,19 @@ setInterval(checkForUpdate, 30 * 60 * 1000);
 // ============================================================
 let agentCounter = 0;
 
-function newAgentId() { return 'a' + (++agentCounter); }
+function newAgentId() { return `${AGENT_SESSION_ID}-a${++agentCounter}`; }
 
 function setActiveAgent(agentId) {
   if (!agentId || !state.agents.has(agentId)) return;
   state.activeAgentId = agentId;
   for (const a of state.agents.values()) {
-    a.dom?.tile?.classList.toggle('active', a.id === agentId);
+    const isActive = a.id === agentId;
+    a.dom?.tile?.classList.toggle('active', isActive);
+    // Blinking is purely cosmetic and costs a repaint per terminal on every
+    // blink tick. With many tiles open at once (multiple windows × several
+    // agents each) that adds up to a lot of idle redraw work for cursors
+    // nobody is looking at — only the focused tile actually needs to blink.
+    if (a.term) try { a.term.options.cursorBlink = isActive; } catch {}
   }
 }
 
@@ -1962,12 +1967,14 @@ function createAgent({ label, primary = false, provider = 'shell' } = {}) {
         <option value="shell">SHELL</option>
         <option value="claude">CLAUDE</option>
         <option value="codex">CODEX</option>
+        <option value="cursor-agent">CURSOR</option>
+        <option value="antigravity">AGY</option>
       </select>
       <button class="agent-restart" title="Restart">⟲</button>
       <button class="agent-external" title="Open in external Terminal.app">↗</button>
       <button class="agent-close" title="Close" ${primary ? 'style="display:none"' : ''}>×</button>
     </div>
-    <div class="agent-term"></div>
+    <div class="agent-term"><div class="agent-term-inner"></div></div>
   `;
   grid.appendChild(tile);
 
@@ -1980,7 +1987,14 @@ function createAgent({ label, primary = false, provider = 'shell' } = {}) {
     restartBtn: tile.querySelector('.agent-restart'),
     externalBtn: tile.querySelector('.agent-external'),
     closeBtn: tile.querySelector('.agent-close'),
-    termHost: tile.querySelector('.agent-term'),
+    termBox: tile.querySelector('.agent-term'),
+    // xterm's FitAddon measures this element's own clientHeight/clientWidth
+    // directly (it reads term.element.parentElement, with no padding
+    // subtraction) — it must stay padding-free or fit() proposes a row/col
+    // count that overshoots the visible box and the bottom row (where the
+    // cursor sits) renders clipped by .agent-term's overflow:hidden. The
+    // visual gutter lives on .agent-term instead.
+    termHost: tile.querySelector('.agent-term-inner'),
   };
   dom.providerSelect.value = provider;
 
@@ -2033,7 +2047,7 @@ function createAgent({ label, primary = false, provider = 'shell' } = {}) {
   return agent;
 }
 
-function createUserAgent({ provider = 'shell' } = {}) {
+function createUserAgent({ provider = 'codex' } = {}) {
   const agent = createAgent({ label: `Agent ${state.agents.size + 1}`, provider });
   if (!agent) return null;
   setActiveAgent(agent.id);
@@ -2109,11 +2123,11 @@ async function bootAgentTerminal(agent) {
   const term = new window.Terminal({
     theme: XTERM_THEME,
     fontFamily: '"NB Akademie Mono", "Space Mono", ui-monospace, SFMono-Regular, Menlo, monospace',
-    fontSize: 12,
+    fontSize: 11,
     lineHeight: 1.2,
     convertEol: true,
-    cursorBlink: true,
-    scrollback: 5000,
+    cursorBlink: agent.id === state.activeAgentId,
+    scrollback: 3000,
     allowProposedApi: true,
   });
   const fitCtor = window.FitAddon && window.FitAddon.FitAddon;
@@ -2123,15 +2137,14 @@ async function bootAgentTerminal(agent) {
   agent.term = term;
   agent.fitAddon = fit;
 
-  agent.dom.termHost.addEventListener('click', () => {
+  agent.dom.termBox.addEventListener('click', () => {
     setActiveAgent(agent.id);
     try { term.focus(); } catch {}
   });
   if (term.onFocus) term.onFocus(() => setActiveAgent(agent.id));
   if (window.ResizeObserver) {
     const ro = new ResizeObserver(() => {
-      if (!agent.dom.tile.isConnected) return;
-      if (fit) try { fit.fit(); } catch {}
+      if (agent.dom.tile.isConnected) scheduleAllFit();
     });
     ro.observe(agent.dom.termHost);
     agent._ro = ro;
@@ -2163,8 +2176,10 @@ async function bootAgentTerminal(agent) {
     term.writeln(`\x1b[31m${r.error}\x1b[0m`);
     agent.dom.activity.textContent = 'failed';
     agent.dom.dot.classList.remove('running');
+    agent.dom.tile.classList.remove('running');
     return;
   }
+  agent.dom.tile.classList.add('running');
   agent.dom.activity.textContent = `${agent.provider} · pid ${r.pid || ''}`;
   try { term.focus(); } catch {}
 }
@@ -2188,12 +2203,15 @@ function relayoutAgentGrid() {
   if (cEl) cEl.textContent = String(state.agents.size);
 }
 
-// Refit terminals when the tab/window shows them. macOS's fullscreen
-// transition fires a burst of resize events; xterm's fit walks every
-// line, so refitting per tick on every agent terminal can hang the
-// renderer. Coalesce to one fit-pass per animation frame.
+// Refit terminals when the tab/window shows them, or when any tile's own
+// ResizeObserver fires (grid relayout from adding/removing an agent,
+// view-switch, sidebar drag). macOS's fullscreen transition alone fires a
+// burst of resize events, and with several tiles each running their own
+// ResizeObserver, a layout change can trigger N independent synchronous
+// fit() calls — each walking every line and forcing a reflow — back to
+// back. Funnel all of them through one fit-pass per animation frame.
 let pendingTermFit = 0;
-window.addEventListener('resize', () => {
+function scheduleAllFit() {
   if (pendingTermFit) return;
   pendingTermFit = requestAnimationFrame(() => {
     pendingTermFit = 0;
@@ -2201,7 +2219,8 @@ window.addEventListener('resize', () => {
       if (a.fitAddon) try { a.fitAddon.fit(); } catch {}
     }
   });
-});
+}
+window.addEventListener('resize', scheduleAllFit);
 function pushLog(kind, text) {
   const list = $('#log-list');
   const el = document.createElement('div');
@@ -2292,7 +2311,7 @@ function labelForKind(k) {
 
 function ensurePrimaryAgent() {
   if (state.primaryAgentId && state.agents.has(state.primaryAgentId)) return;
-  const a = createAgent({ label: 'Primary', primary: true, provider: 'shell' });
+  const a = createAgent({ label: 'Primary', primary: true, provider: 'codex' });
   if (!a) return;
   state.primaryAgentId = a.id;
 }
@@ -2305,16 +2324,46 @@ if (newAgentBtn) {
 setWorkspaceView(localStorage.getItem(VIEW_STORAGE_KEY) || 'agents', false);
 
 // ===== PTY data → write to the right xterm =====
+// Chatty agents (token-by-token model output, spinner redraws) can push many
+// small WS messages per frame. Writing each straight to xterm means a parse
+// pass + repaint per message; with several agents across several windows
+// doing this at once it's a lot of redundant main-thread work for output the
+// eye perceives as one continuous stream anyway. Coalesce everything that
+// arrives within an animation frame into a single write per agent.
+const pendingPtyAgents = new Set();
+let ptyFlushScheduled = false;
+function flushAgentPtyOutput(agent) {
+  if (!agent) return;
+  const chunks = agent._pendingOut;
+  agent._pendingOut = null;
+  pendingPtyAgents.delete(agent);
+  if (agent.term && chunks && chunks.length) agent.term.write(chunks.join(''));
+}
+function flushPtyOutput() {
+  ptyFlushScheduled = false;
+  for (const agent of pendingPtyAgents) {
+    flushAgentPtyOutput(agent);
+  }
+  pendingPtyAgents.clear();
+}
 window.tree.onPtyData(({ agentId, data }) => {
   const agent = state.agents.get(agentId);
   if (!agent || !agent.term) return;
   if (data) agent.lastOutputAt = Date.now();
-  agent.term.write(data);
+  if (!agent._pendingOut) agent._pendingOut = [];
+  agent._pendingOut.push(data);
+  pendingPtyAgents.add(agent);
+  if (!ptyFlushScheduled) {
+    ptyFlushScheduled = true;
+    requestAnimationFrame(flushPtyOutput);
+  }
 });
 window.tree.onPtyExit(({ agentId, exitCode, signal }) => {
   const agent = state.agents.get(agentId);
   if (!agent) return;
+  flushAgentPtyOutput(agent);
   agent.dom.dot.classList.remove('running');
+  agent.dom.tile.classList.remove('running');
   agent.dom.activity.textContent = `exited ${exitCode != null ? `(${exitCode})` : signal ? `[${signal}]` : ''}`;
   if (agent.term) agent.term.writeln(`\r\n\x1b[2m[exited]\x1b[0m`);
 });
@@ -2676,6 +2725,8 @@ document.addEventListener('keydown', (e) => {
     const found = [];
     if (p.claude) found.push('claude');
     if (p.codex) found.push('codex');
+    if (p['cursor-agent']) found.push('cursor-agent');
+    if (p.antigravity) found.push('agy');
     if (p.shell) found.push('shell');
     const stamp = $('#stamp-sub');
     if (stamp && !state.root) stamp.textContent = `providers: ${found.join(' · ')}`;
